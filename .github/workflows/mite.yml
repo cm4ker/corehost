@@ -1,0 +1,77 @@
+name: Build for mite
+
+# Builds corehost.exe + conpty.dll (Release, x64 and ARM64) for the mite
+# terminal. Every push to the mite branch uploads them as an artifact;
+# a mite-v* tag also publishes them as a release.
+
+on:
+  push:
+    branches: [mite]
+    tags: ['mite-v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            vs_arch: amd64
+            extra: ''
+          - arch: arm64
+            vs_arch: arm64
+            extra: -DLIBUNICODE_SIMD_IMPLEMENTATION=none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Build
+        shell: pwsh
+        run: |
+          & "C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\Tools\Launch-VsDevShell.ps1" -Arch ${{ matrix.vs_arch }} -HostArch amd64 -SkipAutomaticLocation
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_TESTS=OFF `
+            ${{ matrix.extra }}
+          cmake --build build --target corehost conpty
+
+          New-Item -ItemType Directory -Force out | Out-Null
+          foreach ($name in 'corehost.exe', 'conpty.dll') {
+            $f = Get-ChildItem build -Recurse -Filter $name | Select-Object -First 1
+            if (!$f) { echo "::error::$name was not produced"; exit 1 }
+            Copy-Item $f.FullName out/
+          }
+          Get-ChildItem out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corehost-${{ matrix.arch }}
+          path: out/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/mite-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Package
+        run: |
+          for arch in x64 arm64; do
+            (cd corehost-$arch && zip ../corehost-$arch.zip corehost.exe conpty.dll)
+          done
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" corehost-x64.zip corehost-arm64.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "corehost built for mite from $GITHUB_SHA"
