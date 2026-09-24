@@ -406,6 +406,10 @@ union vt_message_payload {
 struct vt_message
 {
     vt_message_payload payload;
+    // 键盘序列的 xterm 修饰符编码（CSI 1;m X / CSI n;m ~ 的 m）。1 表示
+    // 无修饰；(m-1) 的 bit0/1/2 分别是 Shift/Alt/Ctrl。输入方向的
+    // vt_input_engine::convert 据此填充 dwControlKeyState。
+    short key_modifier = 1;
 };
 
 struct vt_parse_result
@@ -847,8 +851,16 @@ class vt_parser
             return control_id;
         }
 
-        // 其他 C0/DEL 控制字符。
-        _msg.payload.text = {};
+        // 终端惯例（与 conhost 一致）：0x7F 是普通 Backspace，0x08 是
+        // Ctrl+Backspace。用 key_modifier 传递 Ctrl，engine 据此填充修饰位。
+        if (kind == ground_char_kind::backspace)
+            _msg.key_modifier = 5;
+
+        // 其他 C0/DEL 控制字符按单字符 text 交付。输入方向把它们转换为
+        // Ctrl+字母 KEY_EVENT（丢弃会吞掉终端发来的 ^A..^Z）；输出方向的
+        // 消费者自行决定丢弃。视图指向 parser 成员，生命周期同其它 payload。
+        _ground_control_char = ch;
+        _msg.payload.text = {&_ground_control_char, 1};
         return control_id;
     }
 
@@ -862,6 +874,9 @@ class vt_parser
     }
 
   private:
+    // _parse_ground_control 交付单字符控制符时的存储；payload.text 指向它。
+    char32_t _ground_control_char = 0;
+
     // 消息被消费后清理中央 raw 序列，并把 parser 拉回 ground。
     void _reset_parser_state_after_message() noexcept
     {
@@ -1202,6 +1217,11 @@ class vt_parser
         auto n = (_param_index > 0) ? _get_param(0, 1) : static_cast<short>(1);
         if (n == 0)
             n = 1;
+
+        // 键盘序列的第二参数是 xterm 修饰符（CSI 1;5C = Ctrl+Right、
+        // CSI 3;5~ = Ctrl+Delete）。对非键盘 final 该值无副作用——输出方向
+        // 的消费者不读取 key_modifier。
+        m.key_modifier = (_param_index > 1) ? _get_param(1, 1) : 1;
 
         switch (terminator)
         {

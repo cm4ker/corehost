@@ -33,6 +33,17 @@ struct vt_input_engine
         ke.wVirtualScanCode = 0;
         ke.uChar.UnicodeChar = 0;
         ke.dwControlKeyState = ctrl_state;
+        // xterm 修饰符参数（CSI 1;m X）：(m-1) 的位分别是 Shift/Alt/Ctrl。
+        if (msg.key_modifier > 1)
+        {
+            const int mod = msg.key_modifier - 1;
+            if (mod & 1)
+                ke.dwControlKeyState |= SHIFT_PRESSED;
+            if (mod & 2)
+                ke.dwControlKeyState |= LEFT_ALT_PRESSED;
+            if (mod & 4)
+                ke.dwControlKeyState |= LEFT_CTRL_PRESSED;
+        }
 
         switch (id)
         {
@@ -127,7 +138,11 @@ struct vt_input_engine
         // ── 特殊控制字符 ──
         case vt_message_id::char_del:
             ke.wVirtualKeyCode = VK_BACK;
-            ke.uChar.UnicodeChar = L'\b';
+            // conhost 惯例：0x7F → Backspace（uChar='\b'），0x08 →
+            // Ctrl+Backspace（uChar=0x7F）。Ctrl 位已由上方 key_modifier
+            // 通路填充。
+            ke.uChar.UnicodeChar =
+                (msg.key_modifier > 1 && ((msg.key_modifier - 1) & 4)) ? static_cast<WCHAR>(0x7F) : L'\b';
             return true;
         case vt_message_id::char_sub:
             // Ctrl+Z 在控制台输入里以 SUB 字符出现，VK 值沿用 ASCII 26。

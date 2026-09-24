@@ -56,9 +56,9 @@ inline void set_sgr_foreground_default(WORD &attr) noexcept
 // 应用 SGR 49 到当前 Win32 属性。
 inline void set_sgr_background_default(WORD &attr) noexcept
 {
-    // 保持既有语义：默认背景索引为 7，而不是传统黑色 0。
+    // 默认背景为传统黑色 0，与 conhost 的默认属性 0x07 一致；属性字全程
+    // 使用 Win32 BGRI 位序（见 set_sgr_*_index 的换序）。
     attr &= 0xFF0F;
-    attr |= (7 << 4);
 }
 
 // 将 SGR 前景索引映射到 Win32 属性低 4 位；超出 16 色时忽略。

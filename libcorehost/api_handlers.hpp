@@ -169,8 +169,19 @@ inline void set_sgr_from_win32_attr(vt_message &m, WORD attr) noexcept
 {
     // 调用者传入的是完整 Win32 属性 WORD。本函数只填充 vt_message 中和 SGR
     // 有关的字段，其他字段保持调用前状态。
-    m.payload.sgr.fg.set_index(win32_attr_color_to_sgr_index(attr & 0x0F));
-    m.payload.sgr.bg.set_index(win32_attr_color_to_sgr_index((attr >> 4) & 0x0F));
+    if ((attr & 0xFF) == 0x07)
+    {
+        // 传统默认属性（白字黑底）映射为 SGR 默认色而不是显式 37/40，让
+        // 终端应用自己的主题色（可能是透明/图片背景），与 conhost 的
+        // ConPTY 行为一致。
+        m.payload.sgr.fg.set_default();
+        m.payload.sgr.bg.set_default();
+    }
+    else
+    {
+        m.payload.sgr.fg.set_index(win32_attr_color_to_sgr_index(attr & 0x0F));
+        m.payload.sgr.bg.set_index(win32_attr_color_to_sgr_index((attr >> 4) & 0x0F));
+    }
 
     auto fl = (attr >> 8) & 0xFF;
     if (fl & COMMON_LVB_UNDERSCORE)
@@ -371,8 +382,13 @@ inline void apply_terminal_text_cursor_only(std::u32string_view text, console_st
 
         state.cursor.position.X = static_cast<SHORT>(state.cursor.position.X + cell_count);
         remaining.remove_prefix(consumed);
-        if (state.cursor.position.X > view.Right || !remaining.empty())
+        if (!remaining.empty())
             apply_terminal_line_feed_cursor_only(state, sb);
+        else if (state.cursor.position.X > view.Right)
+            // Deferred EOL wrap (DECAWM): the run filled the last column but
+            // there is nothing more to write — hold the cursor at the last
+            // column instead of advancing. See apply_terminal_text.
+            state.cursor.position.X = view.Right;
     }
 }
 
@@ -392,6 +408,19 @@ inline void apply_terminal_text(std::u32string_view text, console_state &state, 
         remaining.remove_prefix(result.consumed);
         if (result.row_end)
         {
+            if (remaining.empty())
+            {
+                // Deferred EOL wrap (DECAWM): the write filled the row to the
+                // last column but there is no more text. Real terminals hold
+                // the cursor at the last column (pending wrap) instead of
+                // advancing, so a following CR/LF moves down exactly one row.
+                // Advancing here made a full-width line + newline consume two
+                // rows, pushing every later CUP one row too low (e.g. a
+                // two-line oh-my-posh prompt: the input line, and thus the
+                // typed-char echo, landed one row below where it should).
+                state.cursor.position.X = view.Right;
+                break;
+            }
             apply_terminal_line_feed(state, sb);
             continue;
         }
@@ -411,6 +440,10 @@ inline void apply_terminal_text(const vt_message &msg, console_state &state, scr
 inline void consume_write_console_text_run(std::u32string_view text, console_state &state, screen_buffer &sb,
                                            pipe_bridge &bridge, bool emit_vt = true) noexcept
 {
+    // parser 的 other_control 路径交付单字符 C0/DEL；它们只对输入方向有
+    // 意义（Ctrl+字母），输出方向维持既有的丢弃行为。
+    if (text.size() == 1 && (text[0] <= 0x1F || text[0] == 0x7F))
+        return;
     if (emit_vt)
     {
         bridge.vt_write_text(text);
@@ -779,7 +812,23 @@ inline void consume_write_console_vt_message(vt_parser &parser, const vt_parse_r
 {
     if constexpr (id == vt_message_id::unknown_sequence)
     {
-        consume_write_console_text_run(parsed.message.payload.text, state, sb, bridge, emit_vt);
+        // corehost 不认识的 OSC/DCS/APC/PM/SOS 字符串序列原样透传给终端，
+        // 让支持相应协议（OSC 1337 图像、kitty graphics、sixel 等）的终端
+        // 自行处理；不写入本地 screen_buffer，与 osc8_hyperlink 相同。
+        // 其余未知序列维持降级为文本的行为。
+        const auto unknown_raw = parsed.raw_sequence;
+        const bool string_seq = unknown_raw.size() >= 2 && unknown_raw[0] == U'\x1b' &&
+                                (unknown_raw[1] == U']' || unknown_raw[1] == U'P' || unknown_raw[1] == U'_' ||
+                                 unknown_raw[1] == U'^' || unknown_raw[1] == U'X');
+        if (string_seq)
+        {
+            if (emit_vt)
+                bridge.vt_append_raw_sequence(unknown_raw);
+        }
+        else
+        {
+            consume_write_console_text_run(parsed.message.payload.text, state, sb, bridge, emit_vt);
+        }
         parser.reset();
         return;
     }
@@ -1362,10 +1411,16 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
             // RAW_WRITE/WriteConsoleA 在 UTF-8 + VT 模式下可以把原始字节直接写给
             // WT，同时仍用 UTF-32 parser 更新本地 screen_buffer。这样避免重新
             // 编码破坏应用已经构造好的 VT/UTF-8 字节流。
+            // 未设置 DISABLE_NEWLINE_AUTO_RETURN 时按控制台语义把裸 LF 规范化
+            // 为 CRLF；conhost 的 ConPTY 输出同样如此，终端裸 LF 不回到行首。
             if (replay_utf8_to_terminal)
             {
                 LOG2_HEX_IF(bytes <= 16, "replay", data, bytes);
-                bridge.vt_append_str(std::string_view{reinterpret_cast<const char *>(data), bytes});
+                const std::string_view raw_bytes{reinterpret_cast<const char *>(data), bytes};
+                if (state.output_mode & DISABLE_NEWLINE_AUTO_RETURN)
+                    bridge.vt_append_str(raw_bytes);
+                else
+                    bridge.vt_append_str_lf_to_crlf(raw_bytes);
             }
 
             auto &output_parser = bridge.output_parser();

@@ -232,6 +232,9 @@ struct pipe_bridge
     pty_signal_reader _signal{cstate, sbuf};
     // VT 输出批量缓冲，所有发送到宿主终端的字节最终从这里 flush 到 vt_out。
     vt_output_buffer _vt_output;
+    // vt_append_str_lf_to_crlf 跨调用记住最后一个字节，避免把跨 WriteConsole
+    // 边界拆开的 "\r" "\n" 误规范化成 "\r\r\n"。
+    char _replay_last_byte = 0;
     // API handler 和输入/输出转换复用的临时缓冲集合。
     conversion_buffers _conversion;
     // GetConsoleProcessList 可见的连接进程快照。
@@ -623,6 +626,13 @@ struct pipe_bridge
     // screen_buffer 的属性状态由调用方同步维护。
     void vt_write_attr(WORD attr) noexcept
     {
+        if (attr == 0x07)
+        {
+            // 传统默认属性直接映射为 SGR 重置，保留终端自己的默认前景/
+            // 背景（终端可能以透明或图片作为默认背景）。
+            vt_append_str("\x1b[0m"sv);
+            return;
+        }
         // Console 属性低 4 位是前景 BGRI，高 4 位是背景 BGRI；映射表把
         // Win32 颜色编号转换为 SGR 的 ANSI/bright ANSI 编号。
         vt_append_str("\x1b[0"sv);
@@ -690,6 +700,26 @@ struct pipe_bridge
     {
         vt_write_cell(U'\r');
         vt_write_cell(U'\n');
+    }
+
+    // 追加原始字节流，但按 ENABLE_PROCESSED_OUTPUT（无
+    // DISABLE_NEWLINE_AUTO_RETURN）语义把裸 LF 规范化为 CRLF。终端把裸 LF
+    // 视作纯下移（列不变），不补 CR 会导致后续 EL/文本落在错误的列上。
+    void vt_append_str_lf_to_crlf(std::string_view text) noexcept
+    {
+        size_t start = 0;
+        for (size_t i = 0; i != text.size(); ++i)
+        {
+            if (text[i] == '\n' && (i == 0 ? _replay_last_byte : text[i - 1]) != '\r')
+            {
+                vt_append_str(text.substr(start, i - start));
+                vt_append_str("\r\n"sv);
+                start = i + 1;
+            }
+        }
+        vt_append_str(text.substr(start));
+        if (!text.empty())
+            _replay_last_byte = text.back();
     }
 
     // ── vt_msg_send: vt_message → UTF-8 序列化并追加到缓冲 ──
@@ -1481,7 +1511,7 @@ struct pipe_bridge
     }
 
     // ── KEY_EVENT 输出到 input_buffer ──
-    void emit_key(WORD vk, WCHAR uc)
+    void emit_key(WORD vk, WCHAR uc, DWORD ctrl = 0)
     {
         // Win32Input 模式下终端输入要转成 KEY_EVENT，供 GetConsoleInput
         // 使用。这里生成 KEY_DOWN，是否补 KEY_UP 由调用者按路径决定。
@@ -1492,15 +1522,15 @@ struct pipe_bridge
         r.Event.KeyEvent.wVirtualKeyCode = vk;
         r.Event.KeyEvent.wVirtualScanCode = static_cast<WORD>(::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
         r.Event.KeyEvent.uChar.UnicodeChar = uc;
-        r.Event.KeyEvent.dwControlKeyState = 0;
+        r.Event.KeyEvent.dwControlKeyState = ctrl;
         inp.write(&r, 1);
         complete_pending_console_input();
     }
     // 写入 KEY_DOWN/KEY_UP 一对事件。普通按键输入给 GetConsoleInput 时使用；
     // Enter 等特殊路径可只写 KEY_DOWN。
-    void emit_key_pair(WORD vk, WCHAR uc)
+    void emit_key_pair(WORD vk, WCHAR uc, DWORD ctrl = 0)
     {
-        emit_key(vk, uc);
+        emit_key(vk, uc, ctrl);
         INPUT_RECORD up{};
         up.EventType = KEY_EVENT;
         up.Event.KeyEvent.bKeyDown = FALSE;
@@ -1508,7 +1538,7 @@ struct pipe_bridge
         up.Event.KeyEvent.wVirtualKeyCode = vk;
         up.Event.KeyEvent.wVirtualScanCode = static_cast<WORD>(::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
         up.Event.KeyEvent.uChar.UnicodeChar = 0;
-        up.Event.KeyEvent.dwControlKeyState = 0;
+        up.Event.KeyEvent.dwControlKeyState = ctrl;
         inp.write(&up, 1);
         complete_pending_console_input();
     }
@@ -1972,7 +2002,8 @@ struct pipe_bridge
     // 把已构造的 KEY_EVENT 以按下/释放一对写入 input_buffer。
     void _write_key_event_pair(const INPUT_RECORD &t)
     {
-        emit_key_pair(t.Event.KeyEvent.wVirtualKeyCode, t.Event.KeyEvent.uChar.UnicodeChar);
+        emit_key_pair(t.Event.KeyEvent.wVirtualKeyCode, t.Event.KeyEvent.uChar.UnicodeChar,
+                      t.Event.KeyEvent.dwControlKeyState);
     }
 
     // 应用输出方向的终端查询响应需要回到 Console input 队列。调用方传入
@@ -2413,7 +2444,18 @@ struct pipe_bridge
         for (char32_t tc : tm.payload.text)
         {
             if (tc <= 0x1F || tc == 0x7F)
+            {
+                // C0 控制字符是终端对 Ctrl+字母 的编码（^A..^Z；^H/^I/^J/^M/^Z
+                // 由 parser 单独建模，不会到这里）。cooked 读取沿用丢弃行为；
+                // GetConsoleInput 驱动的 shell（PSReadLine 等）需要带
+                // LEFT_CTRL_PRESSED 的 KEY_EVENT 才能匹配 Ctrl+<key> 绑定。
+                if (pending_kind != PendingKind::ConsoleRead && tc >= 0x01 && tc <= 0x1A)
+                {
+                    LOG3(L"[in] CTRL_CHAR ch=U+%04X", (unsigned)tc);
+                    emit_key_pair(static_cast<WORD>(L'A' + tc - 1), static_cast<WCHAR>(tc), LEFT_CTRL_PRESSED);
+                }
                 continue;
+            }
             LOG3(L"[in] TEXT_DISP ch=U+%04X", (unsigned)tc);
             if (pending_kind == PendingKind::ConsoleRead)
                 edit_insert_codepoint(tc);
