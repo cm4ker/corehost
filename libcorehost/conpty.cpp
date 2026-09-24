@@ -161,7 +161,7 @@ void run_conpty_session(win32::handle_view server, win32::handle_view event, win
     // router 持有所有分派入口；run_io_loop_no_setup 只负责 READ_IO 时序、
     // completion 提交和 pending 等待。
     LOG("corehost::conpty::run_conpty_session: entering io loop");
-    corehost::conpty::run_io_loop_no_setup(server, event, router);
+    corehost::conpty::run_io_loop_no_setup(server, event, router, vt_in);
     LOG("corehost::conpty::run_conpty_session: loop returned");
 }
 

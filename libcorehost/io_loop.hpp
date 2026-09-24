@@ -19,17 +19,107 @@
 #include "perf_diag.hpp"
 #include "utility/log.hpp"
 #include "win32/wait.hpp"
+#include <mutex>
 
 namespace corehost::conpty
 {
 
 inline constexpr DWORD io_loop_idle_wait_ms = 16;
 
+// READ_IO on the ConDrv server handle is synchronous: it blocks until a
+// client sends the next console message. A client that only waits on its
+// input handle (WaitForSingleObject/WaitForMultipleObjects on stdin, as
+// Windows OpenSSH does before ReadConsoleInputW) sends nothing, so the loop
+// never reaches on_idle, keystrokes stay in vt_in and InputAvailableEvent is
+// never set: the client and corehost wait on each other forever.
+//
+// This watcher polls vt_in from a second thread and, when terminal input is
+// waiting while the loop thread is blocked in READ_IO, cancels that READ_IO
+// (CancelIoEx on the server handle: it is opened for asynchronous I/O, so
+// DeviceIoControl without an OVERLAPPED waits on the handle rather than
+// doing synchronous I/O that CancelSynchronousIo could reach). The loop
+// treats the abort as "no message", runs
+// on_idle, which turns the bytes into INPUT_RECORDs and sets the event.
+// All console state stays on the loop thread.
+class idle_input_waker
+{
+  public:
+    idle_input_waker(win32::handle_view server, win32::handle_view vt_in) noexcept : _server(server), _vt_in(vt_in)
+    {
+        if (!_vt_in.valid() || !_server.valid())
+            return;
+        _stop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (_stop)
+            _thread = ::CreateThread(nullptr, 0, &idle_input_waker::thread_main, this, 0, nullptr);
+    }
+
+    idle_input_waker(const idle_input_waker &) = delete;
+    idle_input_waker &operator=(const idle_input_waker &) = delete;
+
+    ~idle_input_waker() noexcept
+    {
+        if (_thread)
+        {
+            ::SetEvent(_stop);
+            ::WaitForSingleObject(_thread, INFINITE);
+            ::CloseHandle(_thread);
+        }
+        if (_stop)
+            ::CloseHandle(_stop);
+    }
+
+    // Bracket a READ_IO that may block. Holding the lock while flipping the
+    // flag means a cancel can only ever hit that READ_IO.
+    void enter_read() noexcept
+    {
+        std::lock_guard guard{_lock};
+        _in_read = true;
+    }
+
+    void leave_read() noexcept
+    {
+        std::lock_guard guard{_lock};
+        _in_read = false;
+    }
+
+  private:
+    static DWORD WINAPI thread_main(void *self) noexcept
+    {
+        static_cast<idle_input_waker *>(self)->run();
+        return 0;
+    }
+
+    void run() noexcept
+    {
+        while (::WaitForSingleObject(_stop, 10) == WAIT_TIMEOUT)
+        {
+            DWORD avail = 0;
+            if (!::PeekNamedPipe(_vt_in.get(), nullptr, 0, nullptr, &avail, nullptr) || avail == 0)
+                continue;
+            std::lock_guard guard{_lock};
+            // A cancel that misses (the loop has not entered DeviceIoControl
+            // yet) is retried on the next tick while input is still waiting.
+            if (_in_read && ::CancelIoEx(_server.get(), nullptr))
+                LOG3("idle_input_waker: %lu input bytes waiting, cancelled READ_IO", avail);
+        }
+    }
+
+    win32::handle_view _server;
+    win32::handle_view _vt_in;
+    HANDLE _stop = nullptr;
+    HANDLE _thread = nullptr;
+    std::mutex _lock;
+    bool _in_read = false;
+};
+
 // 运行 ConDrv READ_IO/COMPLETE_IO 主循环。server/event 都是非拥有句柄；
 // router 持有实际状态机。函数通过 READ_IO piggyback 提交同步 completion，
 // 对 pending 请求等待 VT 输入显式完成，并在 server 断开或 bridge 可退出时返回。
-inline void run_io_loop_no_setup(win32::handle_view server, win32::handle_view ev, message_router &router)
+inline void run_io_loop_no_setup(win32::handle_view server, win32::handle_view ev, message_router &router,
+                                 win32::handle_view vt_in = {})
 {
+    idle_input_waker waker{server, vt_in};
+
     // server 是 ConDrv \Server 等待/READ_IO 目标；ev 是客户端 input-available
     // 事件，只用于判断 completion 前是否需要先刷 VT 输出。router 持有
     // io_state/pipe_bridge/api_router，是本循环消费消息的唯一入口。
@@ -101,7 +191,9 @@ inline void run_io_loop_no_setup(win32::handle_view server, win32::handle_view e
         auto read_result = corehost::condrv_io::read_io_result::no_message;
         {
             COREHOST_PERF_SCOPE(io_read_io_try);
+            waker.enter_read();
             read_result = corehost::condrv_io::read_io_try(server, prev_comp, *cur);
+            waker.leave_read();
         }
         if (read_result == corehost::condrv_io::read_io_result::disconnected)
         {

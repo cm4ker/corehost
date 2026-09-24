@@ -96,7 +96,9 @@ inline read_io_result read_io_try(win32::handle_view server, CD_IO_COMPLETE *pre
         return read_io_result::got_message;
 
     auto err = win32::get_last_error();
-    if (err == win32::error::io_pending)
+    // operation_aborted: idle_input_waker cancelled a READ_IO that was
+    // blocking while terminal input waited to be turned into INPUT_RECORDs.
+    if (err == win32::error::io_pending || err == win32::error::operation_aborted)
         return read_io_result::no_message;
     if (err == win32::error::pipe_not_connected || err == win32::error::broken_pipe || err == win32::error::no_data)
         return read_io_result::disconnected;
