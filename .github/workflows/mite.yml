@@ -32,6 +32,21 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      # Cross builds can't run libunicode's table generator; generate the
+      # tables with a native x64 build first (as ci.yml does).
+      - name: Generate libunicode tables
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          & "C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          cmake -S third_parties/libunicode -B build-libunicode-tablegen -G Ninja `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLIBUNICODE_TESTING=OFF `
+            -DLIBUNICODE_TOOLS=OFF `
+            -DLIBUNICODE_EXAMPLES=OFF
+          cmake --build build-libunicode-tablegen --target unicode
+
       - name: Build
         shell: pwsh
         run: |
