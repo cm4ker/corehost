@@ -2781,6 +2781,21 @@ struct pipe_bridge
     {
         _line_found = true;
 
+        // An app that reads VT input with echo off (ssh.exe relaying a remote
+        // shell, TUIs) echoes Enter itself, like a Unix pty in raw mode; the
+        // in-box conhost adds nothing. A local CRLF here (and the enter_dest
+        // CUP it arms) moved the terminal cursor a row below where the
+        // remote side put it, so readline's relative redraws overwrote the
+        // wrong lines.
+        if ((cstate.input_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0 && (cstate.input_mode & ENABLE_ECHO_INPUT) == 0 &&
+            _pending.kind() != PendingKind::ConsoleRead)
+        {
+            LOG2("[bridge] LINE_TERM raw VT input: no local echo");
+            queue_unprocessed_vt_input(bytes, consumed, len);
+            complete_pending();
+            return;
+        }
+
         // 行终止符本地回显统一为 CRLF，与真实 conhost 一致。旧实现非 raw
         // echo 模式只输出裸 LF；Windows Terminal 中裸 LF 只下移不回车，
         // Enter 后 shell 的输出会接在行尾而不是新行首。

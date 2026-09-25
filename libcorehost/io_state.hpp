@@ -126,7 +126,21 @@ struct io_state
         {
             // 后续 CONNECT 只代表子进程加入现有控制台。它共享首个连接的
             // \Input/\Output，因此只填 completion，交给下一轮 READ_IO 提交。
-            corehost::condrv_io::prepare_completion(msg);
+            //
+            // The joining process still needs object ids for its stdin and
+            // stdout, like conhost hands every process. An empty reply left
+            // them 0, so every call on the child's stdout (ssh.exe started
+            // from a shell) was routed as an input-handle call:
+            // SetConsoleMode(stdout) failed and even overwrote the input
+            // mode. Reuse the first connection's ids; the reply must outlive
+            // this call because the next READ_IO submits it.
+            _joined_connection = {};
+            _joined_connection.Process = reinterpret_cast<ULONG_PTR>(condrv_input.get());
+            _joined_connection.Input = reinterpret_cast<ULONG_PTR>(condrv_input.get());
+            _joined_connection.Output = reinterpret_cast<ULONG_PTR>(condrv_output.get());
+            auto &c = corehost::condrv_io::prepare_completion(msg, 0, sizeof(CD_CONNECTION_INFORMATION));
+            c.Write.Data = &_joined_connection;
+            c.Write.Size = sizeof(CD_CONNECTION_INFORMATION);
             completion = connect_completion::inline_complete;
             LOG2("CONNECT joined existing console processCount=%zu", process_count);
         }
@@ -230,8 +244,21 @@ struct io_state
             return object_kind::output;
         if (id != 0 && id == alternate_output_id)
             return object_kind::alternate_output;
+        // The first CONNECT's objects (accept_connection) are the handles
+        // every attached process inherits as stdin/stdout, and their ids are
+        // the handle values themselves. Without this, SetConsoleMode on
+        // stdout was treated as an input-mode request and rejected, so
+        // ssh.exe could not set DISABLE_NEWLINE_AUTO_RETURN and each bare LF
+        // from the remote side also returned the cursor to column 0.
+        if (id != 0 && id == reinterpret_cast<ULONG_PTR>(condrv_input.get()))
+            return object_kind::input;
+        if (id != 0 && id == reinterpret_cast<ULONG_PTR>(condrv_output.get()))
+            return object_kind::output;
         return object_kind::unknown;
     }
+
+    // Reply to the latest joining CONNECT; see handle_connect.
+    CD_CONNECTION_INFORMATION _joined_connection{};
 
     // 完成 RAW_FLUSH 对象消息。input_buffer 的清空由 message_router 负责，
     // 这里只准备 ConDrv completion。
