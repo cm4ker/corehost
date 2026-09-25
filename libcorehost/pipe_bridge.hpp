@@ -506,7 +506,13 @@ struct pipe_bridge
     void sync_cursor_after_write(COORD pos, bool track_terminal_cursor = true) noexcept
     {
         const auto terminal_pos = active_screen_buffer().viewport.relative_position(pos);
-        if (track_terminal_cursor)
+        if (track_terminal_cursor && _terminal_cursor_lost)
+        {
+            // A passed-through image moved the terminal cursor by an amount
+            // corehost can't know; stay unsynced until the next CUP.
+            _terminal.invalidate();
+        }
+        else if (track_terminal_cursor)
         {
             const auto old_cursor = _terminal.cursor();
             LOG3("[bridge] sync_cursor_after_write: pos=(%d,%d) was_tc=(%d,%d) was_col_start=%d was_col_end=%d "
@@ -591,6 +597,7 @@ struct pipe_bridge
     // VT 需要的 1-based 参数。
     void vt_write_cup(SHORT row, SHORT col) noexcept
     {
+        _terminal_cursor_lost = false;
         // 内部坐标沿用 Console 的 0-based COORD；VT CUP 参数是 1-based。
         vt_append_str("\x1b["sv);
         vt_append_int(static_cast<int>(row) + 1);
@@ -1478,6 +1485,20 @@ struct pipe_bridge
     {
         _terminal.set_cursor(c);
     }
+
+    // An inline image (iTerm2 OSC 1337, kitty graphics, sixel) went through
+    // to the terminal, which moves its cursor past the image; corehost's
+    // screen model doesn't. Like conhost, keep the model as is but stop
+    // trusting the terminal cursor, so the next write starts with a CUP from
+    // the model instead of assuming the terminal is already there.
+    void mark_terminal_cursor_lost() noexcept
+    {
+        _terminal_cursor_lost = true;
+        _terminal.invalidate();
+    }
+
+    // Set by mark_terminal_cursor_lost, cleared by the next CUP.
+    bool _terminal_cursor_lost = false;
     // 本地回显一个单列字符后推进终端光标追踪状态。
     void term_cursor_advance() noexcept
     {
@@ -2781,16 +2802,18 @@ struct pipe_bridge
     {
         _line_found = true;
 
-        // An app that reads VT input with echo off (ssh.exe relaying a remote
-        // shell, TUIs) echoes Enter itself, like a Unix pty in raw mode; the
-        // in-box conhost adds nothing. A local CRLF here (and the enter_dest
-        // CUP it arms) moved the terminal cursor a row below where the
-        // remote side put it, so readline's relative redraws overwrote the
-        // wrong lines.
-        if ((cstate.input_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0 && (cstate.input_mode & ENABLE_ECHO_INPUT) == 0 &&
-            _pending.kind() != PendingKind::ConsoleRead)
+        // Like the in-box conhost, echo Enter only for a line read (ReadConsole
+        // or ReadFile) with ENABLE_ECHO_INPUT. Apps that take key events
+        // (PSReadLine, ssh.exe, TUIs) echo it themselves. A local CRLF there
+        // scrolled the terminal when the prompt sat on the bottom row, then
+        // PSReadLine redrew the input at its old coordinates: the command
+        // landed a row below its prompt and the output overwrote it; ssh's
+        // remote readline redraws overwrote the wrong lines the same way.
+        const auto kind = _pending.kind();
+        const bool line_read = kind == PendingKind::ConsoleRead || kind == PendingKind::RawRead;
+        if (!line_read || (cstate.input_mode & ENABLE_ECHO_INPUT) == 0)
         {
-            LOG2("[bridge] LINE_TERM raw VT input: no local echo");
+            LOG2("[bridge] LINE_TERM key-event reader or echo off: no local echo");
             queue_unprocessed_vt_input(bytes, consumed, len);
             complete_pending();
             return;

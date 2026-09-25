@@ -21,6 +21,13 @@ class terminal_cursor_state
         return _cursor_valid;
     }
 
+    // Forget the terminal cursor position; the next write positions it with
+    // an absolute CUP.
+    void invalidate() noexcept
+    {
+        _cursor_valid = false;
+    }
+
     // 设置一个新的可信终端坐标；调用方已经完成 viewport-relative 转换。
     void set_cursor(COORD cursor) noexcept
     {

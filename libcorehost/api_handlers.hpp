@@ -304,6 +304,71 @@ inline SMALL_RECT terminal_scroll_region(const console_state &state, screen_buff
 
 // 将 LF/CRLF 应用到本地 cursor 和 screen_buffer。光标在滚动区域底部时滚动
 // 区域内容，否则只向下移动；X 总是回到 viewport 左边界。
+// Rows an iTerm2 inline image (OSC 1337 File=...;inline=1;height=N:...)
+// occupies when its height is given in cells; 0 otherwise (a height in px,
+// %, or auto would need the image's pixel size and the cell size).
+inline int iterm2_inline_image_rows(std::u32string_view raw) noexcept
+{
+    constexpr std::u32string_view prefix = U"\x1b]1337;File=";
+    if (!raw.starts_with(prefix))
+        return 0;
+    auto args = raw.substr(prefix.size());
+    const auto colon = args.find(U':');
+    if (colon == std::u32string_view::npos)
+        return 0;
+    args = args.substr(0, colon);
+    bool is_inline = false;
+    int rows = 0;
+    while (!args.empty())
+    {
+        const auto semi = args.find(U';');
+        const auto kv = args.substr(0, semi);
+        args = semi == std::u32string_view::npos ? std::u32string_view{} : args.substr(semi + 1);
+        if (kv == U"inline=1")
+            is_inline = true;
+        else if (kv.starts_with(U"height="))
+        {
+            const auto v = kv.substr(7);
+            int n = 0;
+            bool ok = !v.empty();
+            for (const auto c : v)
+            {
+                if (c < U'0' || c > U'9' || n > 1000)
+                {
+                    ok = false;
+                    break;
+                }
+                n = n * 10 + static_cast<int>(c - U'0');
+            }
+            rows = ok ? n : 0;
+        }
+    }
+    return is_inline ? rows : 0;
+}
+
+// True for a passed-through sequence that draws an inline image: iTerm2
+// OSC 1337 File/FileEnd, kitty graphics (APC G) or sixel (DCS ... q).
+inline bool is_inline_image_sequence(std::u32string_view raw) noexcept
+{
+    if (raw.starts_with(U"\x1b]1337;File=") || raw.starts_with(U"\x1b]1337;FileEnd"))
+        return true;
+    if (raw.starts_with(U"\x1b_G"))
+        return true;
+    if (raw.starts_with(U"\x1bP"))
+    {
+        // Sixel: DCS, optional numeric parameters, then 'q'.
+        for (size_t i = 2; i < raw.size(); ++i)
+        {
+            const auto c = raw[i];
+            if (c == U'q')
+                return true;
+            if (!((c >= U'0' && c <= U'9') || c == U';'))
+                return false;
+        }
+    }
+    return false;
+}
+
 inline void apply_terminal_line_feed(console_state &state, screen_buffer &sb) noexcept
 {
     COREHOST_PERF_SCOPE(apply_line_feed);
@@ -824,6 +889,17 @@ inline void consume_write_console_vt_message(vt_parser &parser, const vt_parse_r
         {
             if (emit_vt)
                 bridge.vt_append_raw_sequence(unknown_raw);
+            // Images move the terminal cursor. When the height is given in
+            // cells, move the model the way the terminal does (CR, then one
+            // LF per image row); either way stop trusting the terminal
+            // cursor until the next CUP (see mark_terminal_cursor_lost).
+            if (is_inline_image_sequence(unknown_raw))
+            {
+                if (const int rows = iterm2_inline_image_rows(unknown_raw); rows > 0)
+                    for (int i = 0; i < rows; ++i)
+                        apply_terminal_line_feed(state, sb);
+                bridge.mark_terminal_cursor_lost();
+            }
         }
         else
         {
@@ -1395,6 +1471,13 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
                     LOG2("[api_write_console] swallowed enter echo newline");
                     return;
                 }
+                // Anything else leaves the terminal cursor wherever the app's
+                // own VT puts it. Drop the pending Enter position, or it goes
+                // stale and the next WriteConsole jumps back to it (cmd's
+                // prompt after a VT program exited overwrote that program's
+                // output).
+                if (!is_line_terminator_echo(u32_view(u32s)))
+                    bridge.reset_enter_newline();
             }
 
             if (emit_console_attributes)
