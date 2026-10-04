@@ -354,6 +354,9 @@ struct pipe_bridge
         auto result = _io.read_available(std::span{_readbuf}.subspan(_read_total, room), read);
         if (result == vt_pipe_read_status::bytes)
         {
+            read = take_resize_sync_replies(_readbuf.data() + _read_total, read);
+            if (read == 0)
+                return vt_read_status::empty;
             _read_total += read;
             return vt_read_status::bytes;
         }
@@ -378,6 +381,9 @@ struct pipe_bridge
         auto result = _io.read_blocking(std::span{_readbuf}.subspan(_read_total, room), read);
         if (result == vt_pipe_read_status::bytes)
         {
+            read = take_resize_sync_replies(_readbuf.data() + _read_total, read);
+            if (read == 0)
+                return vt_read_status::empty;
             _read_total += read;
             return vt_read_status::bytes;
         }
@@ -410,7 +416,12 @@ struct pipe_bridge
     // 等待用户输入。
     [[nodiscard]] bool poll_signal_closed()
     {
-        return _signal.has_pipe() && _signal.poll();
+        if (!_signal.has_pipe())
+            return false;
+        const bool closed = _signal.poll();
+        if (const auto size = _signal.take_resize())
+            apply_terminal_resize(*size);
+        return closed;
     }
 
     // ── 持久转换缓冲区访问器 ──
@@ -1499,6 +1510,11 @@ struct pipe_bridge
 
     // Set by mark_terminal_cursor_lost, cleared by the next CUP.
     bool _terminal_cursor_lost = false;
+    // DSR CPR queries sent after terminal resizes whose replies haven't come
+    // back yet, and the model cursor (viewport-relative) when the newest one
+    // was sent. See apply_terminal_resize.
+    int _resize_sync_outstanding = 0;
+    COORD _resize_sync_cursor{0, 0};
     // 本地回显一个单列字符后推进终端光标追踪状态。
     void term_cursor_advance() noexcept
     {
@@ -2094,6 +2110,7 @@ struct pipe_bridge
         auto result = _io.read_available(std::span{_readbuf}, read);
         if (result == vt_pipe_read_status::bytes)
         {
+            read = take_resize_sync_replies(_readbuf.data(), read);
             _queued_vt_input.insert(_queued_vt_input.end(), _readbuf.data(), _readbuf.data() + read);
             LOG3("[bridge] queue_available_vt_input: read=%lu total=%zu", read, _queued_vt_input.size());
             return true;
@@ -2399,6 +2416,14 @@ struct pipe_bridge
             LOG2("[bridge] cpr_response: inherit cursor (%d,%d)", cstate.cursor.position.X, cstate.cursor.position.Y);
             return true;
         }
+        if (_resize_sync_outstanding > 0 && m.payload.cpr.row > 0 && m.payload.cpr.col > 0)
+        {
+            // Replies come back in request order; only the one for the
+            // newest resize describes the terminal as it is now.
+            if (--_resize_sync_outstanding == 0)
+                finish_resize_sync({static_cast<SHORT>(m.payload.cpr.col - 1), static_cast<SHORT>(m.payload.cpr.row - 1)});
+            return true;
+        }
         LOG2("[bridge] cpr_response: ignored pending=%d row=%d col=%d", _terminal.pending_inherit_cursor(),
              m.payload.cpr.row, m.payload.cpr.col);
         return false;
@@ -2413,6 +2438,146 @@ struct pipe_bridge
         ir.Event.KeyEvent.wVirtualKeyCode = VK_TAB;
         ir.Event.KeyEvent.uChar.UnicodeChar = L'\t';
         _write_key_event_pair(ir);
+    }
+
+    // PtySignal ResizeWindow. By the time it arrives the terminal has already
+    // resized its own screen and reflowed the text on it. Resize the model
+    // the way terminals do (blank rows below the cursor go first, then rows
+    // leave at the top so the cursor stays on screen; the old code cropped
+    // the bottom and left the cursor past the end), then ask the terminal
+    // where its cursor is: reflow can move it in ways the model can't
+    // reproduce, and every later CUP and GetConsoleScreenBufferInfo depends
+    // on the two agreeing. finish_resize_sync applies the answer.
+    void apply_terminal_resize(COORD new_size) noexcept
+    {
+        auto &screen = active_screen_buffer();
+        LOG2("[bridge] terminal resize: old=(%d,%d) new=(%d,%d) cursor=(%d,%d)", cstate.screen_buffer_size.X,
+             cstate.screen_buffer_size.Y, new_size.X, new_size.Y, cstate.cursor.position.X, cstate.cursor.position.Y);
+        // No early return for an unchanged size: take_resize keeps only the
+        // newest of several signals, and the terminal went through (and
+        // reflowed for) the ones in between, so the cursor sync still runs.
+
+        SHORT used = static_cast<SHORT>(cstate.cursor.position.Y + 1);
+        for (SHORT y = static_cast<SHORT>(screen.size.Y - 1); y >= used; --y)
+        {
+            if (screen.row_has_text(y))
+            {
+                used = static_cast<SHORT>(y + 1);
+                break;
+            }
+        }
+        const SHORT shift = used > new_size.Y ? static_cast<SHORT>(used - new_size.Y) : SHORT{0};
+        if (shift > 0)
+        {
+            screen.shift_rows(static_cast<SHORT>(-shift), cstate.default_attributes);
+            cstate.cursor.position.Y = static_cast<SHORT>(cstate.cursor.position.Y - shift);
+        }
+
+        cstate.screen_buffer_size = new_size;
+        cstate.max_window_size = new_size;
+        screen.viewport.reset_to_buffer(new_size);
+        screen.resize(new_size);
+        if (&screen != &sbuf)
+        {
+            // The main buffer, behind the alternate one, gets the new size too.
+            sbuf.viewport.reset_to_buffer(new_size);
+            sbuf.resize(new_size);
+        }
+        cstate.clamp_cursor_to_buffer();
+
+        const auto cursor = screen.viewport.relative_position(cstate.cursor.position);
+        if (_terminal.cursor_valid())
+            term_cursor_set(cursor);
+        _terminal.shift_enter_dest(static_cast<SHORT>(-shift), new_size.Y);
+
+        // conhost tells apps that asked for it (full-screen ones redraw).
+        if (cstate.input_mode & ENABLE_WINDOW_INPUT)
+        {
+            INPUT_RECORD rec{};
+            rec.EventType = WINDOW_BUFFER_SIZE_EVENT;
+            rec.Event.WindowBufferSizeEvent.dwSize = new_size;
+            inp.write(&rec, 1);
+            complete_pending_console_input();
+        }
+
+        _resize_sync_cursor = cursor;
+        ++_resize_sync_outstanding;
+        vt_write_dsr_cpr();
+        vt_flush();
+    }
+
+    // While resize syncs are outstanding, take the terminal's replies
+    // (ESC [ row ; col R) out of freshly read input before anything else sees
+    // it: a raw ReadFile (findstr, copy con) returns input bytes as read, and
+    // echoes them, so the reply would reach the app as typed text. Returns
+    // the new length of data. A reply split across reads still reaches
+    // process_input_cpr_response.
+    DWORD take_resize_sync_replies(char8_t *data, DWORD len) noexcept
+    {
+        if (_resize_sync_outstanding == 0)
+            return len;
+        DWORD out = 0;
+        for (DWORD i = 0; i < len;)
+        {
+            if (_resize_sync_outstanding > 0 && data[i] == u8'\x1b')
+            {
+                COORD reported{};
+                if (const DWORD n = match_cpr_reply(data + i, len - i, reported); n != 0)
+                {
+                    if (--_resize_sync_outstanding == 0)
+                        finish_resize_sync(reported);
+                    i += n;
+                    continue;
+                }
+            }
+            data[out++] = data[i++];
+        }
+        return out;
+    }
+
+    // Length of the CPR reply `ESC [ row ; col R` at the start of data (0 if
+    // there isn't a whole one), and its 0-based position.
+    static DWORD match_cpr_reply(const char8_t *data, DWORD len, COORD &reported) noexcept
+    {
+        if (len < 6 || data[0] != u8'\x1b' || data[1] != u8'[')
+            return 0;
+        int values[2] = {0, 0};
+        DWORD i = 2;
+        for (int v = 0; v != 2; ++v)
+        {
+            const DWORD start = i;
+            while (i < len && data[i] >= u8'0' && data[i] <= u8'9' && i - start < 5)
+                values[v] = values[v] * 10 + (data[i++] - u8'0');
+            if (i == start || i == len || data[i] != (v == 0 ? u8';' : u8'R'))
+                return 0;
+            ++i;
+        }
+        if (values[0] == 0 || values[1] == 0)
+            return 0;
+        reported = {static_cast<SHORT>(values[1] - 1), static_cast<SHORT>(values[0] - 1)};
+        return i;
+    }
+
+    // The terminal's answer to apply_terminal_resize's DSR: its cursor sat at
+    // `reported` when the model's sat at _resize_sync_cursor. Output since
+    // then moved both the same way, so shift the model (rows and cursor) by
+    // the difference.
+    void finish_resize_sync(COORD reported) noexcept
+    {
+        auto &screen = active_screen_buffer();
+        const SHORT dx = static_cast<SHORT>(reported.X - _resize_sync_cursor.X);
+        const SHORT dy = static_cast<SHORT>(reported.Y - _resize_sync_cursor.Y);
+        LOG2("[bridge] resize sync: terminal=(%d,%d) model=(%d,%d)", reported.X, reported.Y, _resize_sync_cursor.X,
+             _resize_sync_cursor.Y);
+        if (dx == 0 && dy == 0)
+            return;
+        screen.shift_rows(dy, cstate.default_attributes);
+        cstate.cursor.position.X = static_cast<SHORT>(cstate.cursor.position.X + dx);
+        cstate.cursor.position.Y = static_cast<SHORT>(cstate.cursor.position.Y + dy);
+        cstate.clamp_cursor_to_buffer();
+        if (_terminal.cursor_valid())
+            term_cursor_set(screen.viewport.relative_position(cstate.cursor.position));
+        _terminal.shift_enter_dest(dy, screen.size.Y);
     }
 
     // 处理终端 resize 通知：更新 console_state 尺寸、活动 screen_buffer 和

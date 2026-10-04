@@ -176,6 +176,14 @@ class terminal_cursor_state
         return _enter_dest;
     }
 
+    // The terminal's rows moved by dy (a resize); keep the post-Enter
+    // position on the same line, inside the `rows` the screen now has.
+    void shift_enter_dest(SHORT dy, SHORT rows) noexcept
+    {
+        const int y = _enter_dest.Y + dy;
+        _enter_dest.Y = static_cast<SHORT>(y < 0 ? 0 : (y >= rows ? rows - 1 : y));
+    }
+
     // 清除 Enter 后定位修正，供 clear/prompt 重绘等已经自行定位的路径使用。
     void reset_enter_newline() noexcept
     {

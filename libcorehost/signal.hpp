@@ -17,7 +17,9 @@
 #pragma once
 #include <windows.h>
 #include <cstddef>
+#include <optional>
 #include <span>
+#include <utility>
 #include "win32/handle.hpp"
 #include "win32/io.hpp"
 #include "utility/log.hpp"
@@ -34,8 +36,8 @@ enum class PtySignal
     ClearBuffer = 2,
     // WT 设置父窗口。corehost 不创建真实窗口，当前只消费消息以保持管道同步。
     SetParent = 3,
-    // WT 通知终端行列变化。轮询路径更新 screen_buffer 尺寸、viewport 和
-    // console_state 的有效范围。
+    // WT 通知终端行列变化。The reader records the size; pipe_bridge resizes
+    // the model and resyncs the cursor with the terminal (see take_resize).
     ResizeWindow = 8,
 };
 
@@ -68,6 +70,14 @@ class pty_signal_reader
     // 断开或不可读，会话应停止等待终端输入并按 EOF 处理。
     [[nodiscard]] bool poll();
 
+    // The newest ResizeWindow size seen by poll() since the last call, if
+    // any. Resizing needs the bridge (terminal cursor, VT output, input
+    // events), so the reader only records it.
+    [[nodiscard]] std::optional<COORD> take_resize() noexcept
+    {
+        return std::exchange(_resize, std::nullopt);
+    }
+
   private:
     // 由消息 id 返回 payload 长度；0 表示未知 id（协议损坏，退出程序）。
     static size_t payload_size_for(unsigned short id) noexcept;
@@ -78,6 +88,7 @@ class pty_signal_reader
     win32::handle_view _pipe;
     console_state &_state;
     screen_buffer &_sbuf;
+    std::optional<COORD> _resize;
 };
 
 } // namespace corehost::conpty

@@ -81,6 +81,31 @@ struct screen_buffer
             _rows[y].copy_from(old_rows[y], 0, 0, static_cast<uint16_t>(old_size.X));
     }
 
+    // Move every row by dy: negative moves content up (rows leave at the
+    // top), positive moves it down (rows leave at the bottom). Uncovered
+    // rows become blank. Used to follow the terminal when it resizes.
+    void shift_rows(SHORT dy, WORD fill_attr) noexcept
+    {
+        if (dy == 0)
+            return;
+        const SMALL_RECT all{0, 0, static_cast<SHORT>(size.X - 1), static_cast<SHORT>(size.Y - 1)};
+        scroll(all, all, false, COORD{0, dy}, U' ', fill_attr);
+    }
+
+    // true if row y has any visible character (attributes alone don't count).
+    bool row_has_text(SHORT y) const noexcept
+    {
+        if (!_valid_y(y))
+            return false;
+        for (SHORT x = 0; x < size.X; ++x)
+        {
+            const char32_t cp = at_u32({x, y});
+            if (cp != 0 && cp != U' ')
+                return true;
+        }
+        return false;
+    }
+
     // ── 行访问 ──
     // 返回逻辑行 y 对应的物理行。调用方必须传入有效 y；全屏垂直滚动后
     // _row_origin 可能非 0，因此不能直接索引 _rows[y]。

@@ -128,15 +128,14 @@ void pty_signal_reader::handle_message(unsigned short id, std::span<const std::b
         break;
     }
     case PtySignal::ResizeWindow: {
-        // ResizeWindow 是 WT 主动通知的可见尺寸。state 中三个尺寸保持一致，
-        // 因为当前 ConPTY 模型没有独立 scrollback buffer。
+        // ResizeWindow 是 WT 主动通知的可见尺寸。Only the newest size matters
+        // when several arrive in one poll (a window being dragged);
+        // pipe_bridge::apply_terminal_resize does the work.
         COORD sz{};
         std::memcpy(&sz, payload.data(), sizeof(sz));
         LOG2("PtySignal ResizeWindow size=%dx%d", sz.X, sz.Y);
-        _state.screen_buffer_size = sz;
-        _state.max_window_size = sz;
-        _sbuf.viewport.reset_to_buffer(sz);
-        _sbuf.resize(sz);
+        if (sz.X > 0 && sz.Y > 0)
+            _resize = sz;
         break;
     }
     default:
