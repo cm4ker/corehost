@@ -43,6 +43,7 @@ target_sources(libcorehost
                 screen_buffer.hpp
                 screen_buffer_row.hpp
                 signal.hpp
+                signal_read_canceller.hpp
                 terminal_cursor_state.hpp
                 text_measurement_mode.hpp
                 viewport_render.hpp

@@ -42,6 +42,7 @@
 #include "pending_io_state.hpp"
 #include "command_history_state.hpp"
 #include "signal.hpp"
+#include "signal_read_canceller.hpp"
 #include "perf_diag.hpp"
 #include "utility/log.hpp"
 #include "win32/wait.hpp"
@@ -55,8 +56,8 @@ class pipe_bridge_testable;
 
 struct pipe_bridge
 {
-    // 有信号管道时等待 pending VT 输入的时间片。信号消息和 VT 输入是两个
-    // 独立来源，任一方都不能用无限阻塞等待。
+    // Poll period of the pending wait when signal_read_canceller cannot run
+    // and the loop has to poll vt_in and the signal pipe instead of blocking.
     static constexpr DWORD pending_vt_input_wait_ms = 16;
 
     // ── 子系统 ──
@@ -230,6 +231,9 @@ struct pipe_bridge
     // 非阻塞轮询 WT 信号管道的 PtySignal 消息；会话主循环在 idle/pending
     // 等待路径中推进它。无信号管道时 has_pipe() 为 false。
     pty_signal_reader _signal{cstate, sbuf};
+    // Cancels the blocking vt_in read of the pending wait when a PtySignal
+    // arrives (see wait_for_pending_vt_input).
+    signal_read_canceller _signal_canceller;
     // VT 输出批量缓冲，所有发送到宿主终端的字节最终从这里 flush 到 vt_out。
     vt_output_buffer _vt_output;
     // vt_append_str_lf_to_crlf 跨调用记住最后一个字节，避免把跨 WriteConsole
@@ -364,13 +368,16 @@ struct pipe_bridge
         return result == vt_pipe_read_status::empty ? vt_read_status::empty : vt_read_status::eof;
     }
 
-    // 阻塞读取 vt_in。只允许在没有 shutdown event 的路径调用，因为 ReadFile
-    // 阻塞后无法被 signal 线程唤醒。
-    [[nodiscard]] vt_read_status read_blocking_vt_input()
+    // 阻塞读取 vt_in，直到有字节、EOF 或 signal_read_canceller 取消读取
+    // (returns empty). `cancellable` arms the canceller around ReadFile.
+    [[nodiscard]] vt_read_status read_blocking_vt_input(bool cancellable = false)
     {
-        // 阻塞读取只在没有 shutdown event 时使用；有 shutdown event 的路径必须
-        // 按时间片等待，否则关闭通知不能打断 ReadFile。
-        DWORD room = static_cast<DWORD>(_readbuf.size()) - _read_total;
+        // Same capacity rule as read_available_vt_input: a RawRead must not
+        // take more bytes than it can return.
+        auto limit = _readbuf.size();
+        if (_pending.kind() == PendingKind::RawRead && _pending.raw_read())
+            limit = raw_read_capacity(*_pending.raw_read());
+        DWORD room = static_cast<DWORD>(limit) - _read_total;
         if (room == 0)
             return vt_read_status::full;
 
@@ -378,7 +385,11 @@ struct pipe_bridge
             return vt_read_status::bytes;
 
         DWORD read = 0;
+        if (cancellable)
+            _signal_canceller.enter_read();
         auto result = _io.read_blocking(std::span{_readbuf}.subspan(_read_total, room), read);
+        if (cancellable)
+            _signal_canceller.leave_read();
         if (result == vt_pipe_read_status::bytes)
         {
             read = take_resize_sync_replies(_readbuf.data() + _read_total, read);
@@ -1284,8 +1295,9 @@ struct pipe_bridge
         }
     }
 
-    // 在存在 pending 读请求时等待 VT 输入或信号消息。有信号管道时按 16ms
-    // 时间片轮询，无信号管道时才允许阻塞读 vt_in。
+    // 在存在 pending 读请求时等待 VT 输入或信号消息。Blocks in ReadFile on
+    // vt_in; with a signal pipe, signal_read_canceller aborts that read when a
+    // PtySignal arrives so the next call can handle it.
     void wait_for_pending_vt_input()
     {
         vt_flush();
@@ -1298,11 +1310,10 @@ struct pipe_bridge
             return;
         }
 
-        if (_signal.has_pipe())
+        const bool has_signal = _signal.has_pipe();
+        if (has_signal)
         {
-            // 有信号管道时不能进入阻塞 ReadFile：resize/clear/断管都依赖主
-            // 线程轮询。先处理已到达的信号，再等待 vt_in 短时间片；vt_in
-            // 有新数据或断管时都会触发唤醒，避免固定延时空转。
+            // 先处理已到达的信号（resize/clear/断管）。
             if (poll_signal_closed())
             {
                 // 信号管道关闭表示终端不再服务。pending 读不能继续等待用户
@@ -1310,19 +1321,19 @@ struct pipe_bridge
                 complete_pending_with_eof();
                 return;
             }
-            if (const auto wait = win32::wait_one(_io.vt_input(), pending_vt_input_wait_ms); wait.abandoned())
+            // Waiting on vt_in is no option: a pipe handle is always signaled,
+            // so such a wait returns at once and the loop spins. Without the
+            // canceller, fall back to a fixed poll period.
+            if (!_signal_canceller.start(_signal.pipe()))
             {
-                LOG("[bridge] pending vt input wait abandoned");
-                complete_pending_with_eof();
+                ::Sleep(pending_vt_input_wait_ms);
+                drain_available_vt_input();
                 return;
             }
-            drain_available_vt_input();
-            return;
         }
 
-        // 无信号管道：没有其他等待源需要服务，可以阻塞读 vt_in。
         const auto old_total = _read_total;
-        switch (read_blocking_vt_input())
+        switch (read_blocking_vt_input(has_signal))
         {
         case vt_read_status::bytes:
             process_new_vt_input(old_total);

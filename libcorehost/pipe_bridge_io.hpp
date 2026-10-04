@@ -100,8 +100,8 @@ class pipe_bridge_io
         return read_from_vt_input(destination.first(to_read), read_bytes);
     }
 
-    // 阻塞读取 vt_in，直到有字节或 EOF。只允许在没有信号管道的等待路径使用
-    // 它，因为 ReadFile 阻塞后不会被任何会话事件打断。
+    // 阻塞读取 vt_in，直到有字节或 EOF。With a signal pipe the caller arms a
+    // signal_read_canceller first; a cancelled read returns empty.
     [[nodiscard]] vt_pipe_read_status read_blocking(std::span<char8_t> destination, DWORD &read_bytes) noexcept
     {
         // 只在没有信号管道的路径使用；调用方接受 ReadFile 阻塞到有输入或 EOF。
@@ -168,6 +168,9 @@ class pipe_bridge_io
             COREHOST_PERF_SCOPE_AMOUNT(vt_input_read_file, destination.size());
             const auto result = win32::read_some(_vt_input, destination);
             read_bytes = result.bytes;
+            // signal_read_canceller aborted a blocking read: no input, not EOF.
+            if (result.error == win32::error::operation_aborted)
+                return vt_pipe_read_status::empty;
             if (!result.success())
             {
                 LOG("[bridge_io] read=%lu status=%u err=%u", read_bytes, static_cast<unsigned>(result.status),

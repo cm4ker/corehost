@@ -66,6 +66,11 @@ class pty_signal_reader
         return _pipe.valid();
     }
 
+    [[nodiscard]] win32::handle_view pipe() const noexcept
+    {
+        return _pipe;
+    }
+
     // 非阻塞读取并处理信号消息。函数不等待新数据；返回 true 表示管道已
     // 断开或不可读，会话应停止等待终端输入并按 EOF 处理。
     [[nodiscard]] bool poll();
