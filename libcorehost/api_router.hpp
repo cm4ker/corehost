@@ -57,6 +57,21 @@ struct api_router
             return;
 
         LOG2("switch active screen buffer alt=%d previous=%d", alt, alt_active);
+        // A terminal resize only reaches the active buffer, so the one coming
+        // up may still have an older size (the alternate one: the size the
+        // console started with). Give it the current window size first:
+        // native Windows less (CreateConsoleScreenBuffer +
+        // SetConsoleActiveScreenBuffer) otherwise wrapped and positioned
+        // every line at the old width while the terminal used the new one.
+        auto &next = alt ? sb_alt : sb_main;
+        if (next.size.X != state.screen_buffer_size.X || next.size.Y != state.screen_buffer_size.Y)
+        {
+            LOG2("resize %s buffer (%d,%d) -> (%d,%d) on activation", alt ? "alternate" : "main", next.size.X,
+                 next.size.Y, state.screen_buffer_size.X, state.screen_buffer_size.Y);
+            next.resize(state.screen_buffer_size);
+            next.viewport.reset_to_buffer(state.screen_buffer_size);
+            state.clamp_cursor_to_buffer();
+        }
         alt_active = alt;
         bridge.set_active_screen_buffer(active_screen_buffer());
 
