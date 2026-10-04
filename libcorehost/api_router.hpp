@@ -36,6 +36,8 @@ struct api_router
     pipe_bridge &bridge;
     // false 使用主缓冲区；true 使用备用缓冲区。
     bool alt_active = false;
+    // The main buffer's cursor while the alternate one is active.
+    COORD main_cursor{};
 
     // 返回当前 Console API 应读写的 screen_buffer。返回引用由 alt_active 决定；
     // 调用方不能保存到切换之后继续使用。
@@ -72,17 +74,32 @@ struct api_router
             next.viewport.reset_to_buffer(state.screen_buffer_size);
             state.clamp_cursor_to_buffer();
         }
+        // Each screen buffer has its own cursor in conhost; state.cursor is
+        // shared, so keep the main buffer's aside while the other is up.
+        if (alt)
+            main_cursor = state.cursor.position;
         alt_active = alt;
         bridge.set_active_screen_buffer(active_screen_buffer());
 
         // DECSET/DECRST 1049 让终端切换备用缓冲区。随后重绘本地 active
         // screen_buffer，保证终端内容与 libcorehost 内存状态一致。
         if (alt)
+        {
             bridge.vt_append_str("\x1b[?1049h"sv);
-        else
-            bridge.vt_append_str("\x1b[?1049l"sv);
+            bridge.vt_flush();
+            vt_write_screen_snapshot();
+            return;
+        }
+        // 1049l brings back the terminal's own main screen and the cursor it
+        // saved at 1049h. Don't repaint it from sb_main: text that went to
+        // the terminal raw (PSReadLine's prompt and command line, VT apps)
+        // isn't in the model, so the repaint blanked the command that started
+        // the program, unlike conhost.
+        state.cursor.position = main_cursor;
+        state.clamp_cursor_to_buffer();
+        bridge.vt_append_str("\x1b[?1049l"sv);
         bridge.vt_flush();
-        vt_write_screen_snapshot();
+        bridge.sync_cursor_after_write(state.cursor.position);
     }
 
     // 将当前 active screen buffer 的可见 viewport 写回宿主终端。函数只重绘
