@@ -120,11 +120,14 @@ void pty_signal_reader::handle_message(unsigned short id, std::span<const std::b
         break;
     }
     case PtySignal::SetParent: {
-        // WT 按 ULONG_PTR 发送 HWND；corehost 不重新设置父窗口，只消费字段
-        // 保持后续信号边界正确。
+        // WT 按 ULONG_PTR 发送 HWND. Like conhost, the terminal's window
+        // becomes the owner of the pseudo window, so
+        // GetAncestor(GetConsoleWindow(), GA_ROOTOWNER) finds the terminal.
         ULONG_PTR hwnd = 0;
         std::memcpy(&hwnd, payload.data(), sizeof(hwnd));
         LOG2("PtySignal SetParent hwnd=%p", reinterpret_cast<void *>(hwnd));
+        if (_state.console_window)
+            ::SetWindowLongPtrW(_state.console_window, GWLP_HWNDPARENT, static_cast<LONG_PTR>(hwnd));
         break;
     }
     case PtySignal::ResizeWindow: {

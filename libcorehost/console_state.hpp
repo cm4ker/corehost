@@ -168,6 +168,8 @@ struct console_state
     // ── Screen Buffer 信息 ──
     COORD screen_buffer_size{default_console_size};
     COORD max_window_size{default_console_size};
+    // What GetConsoleWindow returns (see pseudo_window.hpp); NULL if none.
+    HWND console_window = nullptr;
     // 0x07 是传统控制台白前景/黑背景属性。
     WORD default_attributes = 0x07;
     WORD popup_attributes = 0x07;

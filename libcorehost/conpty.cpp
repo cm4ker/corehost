@@ -18,6 +18,7 @@
 #include "api_router.hpp"
 #include "api_handlers.hpp"
 #include "message_router.hpp"
+#include "pseudo_window.hpp"
 #include "utility/log.hpp"
 #include "default_console_size.hpp"
 
@@ -57,6 +58,10 @@ void run_conpty_session(win32::handle_view server, win32::handle_view event, win
     // 会话初始光标总是 0-based (0,0)。inherit_cursor=true 时后面会通过 CPR
     // 覆盖这个值。
     state.cursor.position = {0, 0};
+
+    // The window GetConsoleWindow returns; lives as long as the session.
+    pseudo_window console_window;
+    state.console_window = console_window.hwnd();
 
     // 文本测量策略写入 state，后续 api_handlers/vt_msg_dispatch 不再读取 config。
     state.text_measurement = config.text_measurement;

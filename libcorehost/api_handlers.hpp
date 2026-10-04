@@ -3568,8 +3568,8 @@ inline bool api_l3_get_history(corehost::condrv_io::io_msg &msg, console_state &
 }
 
 // ── 0x1F GetConsoleWindow ──
-// GetConsoleWindow：返回当前宿主窗口句柄。corehost 不保存单独窗口状态。
-inline bool api_l3_get_console_window(corehost::condrv_io::io_msg &msg, console_state &, screen_buffer &,
+// GetConsoleWindow: the session's hidden pseudo window (pseudo_window.hpp).
+inline bool api_l3_get_console_window(corehost::condrv_io::io_msg &msg, console_state &state, screen_buffer &,
                                       input_buffer &, pipe_bridge &) noexcept
 {
     if (msg.descriptor.InputSize < sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_GETCONSOLEWINDOW_MSG))
@@ -3579,7 +3579,7 @@ inline bool api_l3_get_console_window(corehost::condrv_io::io_msg &msg, console_
     }
 
     auto *r = reinterpret_cast<CONSOLE_GETCONSOLEWINDOW_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
-    r->hwnd = ::GetConsoleWindow(); // 返回实际 HWND (可能 NULL)
+    r->hwnd = state.console_window;
     ucomplete_sz(msg, sizeof(CONSOLE_GETCONSOLEWINDOW_MSG));
     return true;
 }
