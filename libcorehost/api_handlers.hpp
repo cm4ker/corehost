@@ -1791,11 +1791,44 @@ inline bool api_fill_output(corehost::condrv_io::io_msg &msg, console_state &sta
 
                 fill_text.clear();
                 fill_text.reserve(n);
+                ULONG text_end = 0;
                 for (ULONG i = 0; i != n; ++i)
-                    fill_text.push_back(sb.at_u32({static_cast<SHORT>(x + i), y}));
-                vt_message m_text{};
-                m_text.payload.text = u32_view(fill_text);
-                bridge.vt_msg_send<vt_message_id::text>(m_text);
+                {
+                    const COORD c{static_cast<SHORT>(x + i), y};
+                    fill_text.push_back(sb.at_u32(c));
+                    if (fill_text.back() != U' ' || sb.glyph_width(c) != 1)
+                        text_end = i + 1;
+                }
+                // Trailing blanks go out as an erase, not as spaces: a space
+                // is content to the terminal, so after Clear-Host (char fill
+                // + this attribute fill over the whole screen) every row
+                // looked non-empty and a shorter window pushed the prompt into
+                // scrollback instead of dropping the blank rows below it.
+                // conhost does the same. Underline/reverse/grid attributes
+                // still need the spaces to show.
+                if ((fill_attr & 0xFF00) != 0)
+                    text_end = n;
+                if (text_end != 0)
+                {
+                    vt_message m_text{};
+                    m_text.payload.text = u32_view(fill_text).substr(0, text_end);
+                    bridge.vt_msg_send<vt_message_id::text>(m_text);
+                }
+                if (text_end != n)
+                {
+                    if (x + n == static_cast<ULONG>(sb.size.X))
+                    {
+                        vt_message m_el{};
+                        m_el.payload.erase_mode = 0;
+                        bridge.vt_msg_send<vt_message_id::erase_in_line>(m_el);
+                    }
+                    else
+                    {
+                        vt_message m_ech{};
+                        m_ech.payload.count.value = static_cast<short>(n - text_end);
+                        bridge.vt_msg_send<vt_message_id::erase_characters>(m_ech);
+                    }
+                }
 
                 remaining -= n;
                 x = 0;
