@@ -231,6 +231,9 @@ struct console_state
         WORD attributes = 0x07;
         bool has_state = false;
     } decsc_cursor;
+    // Cursor saved by an app's own ESC[?1049h, put back by ESC[?1049l the
+    // way the terminal does it.
+    saved_cursor alt_screen_cursor;
 
     // ── DECSTBM 滚动区域 ──
     // 1-based viewport-relative 行号；scroll_region_bottom=0 表示当前 viewport

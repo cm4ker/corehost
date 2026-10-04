@@ -433,9 +433,20 @@ inline void vt_msg_apply_state(const vt_message &msg, console_state &state, scre
         // 处理，Console API 查询暂不暴露该状态。
         break;
     case vt_message_id::use_alternate_buffer:
-    case vt_message_id::use_main_buffer:
         // active screen buffer 由 api_router::switch_active_screen_buffer 切换。
         // 这里不修改 sb，避免一个消息在 router 和 state 层重复切换。
+        // The terminal saves the cursor here and restores it at 1049l; do
+        // the same, or the shell's next prompt goes wherever the full-screen
+        // app left its cursor (MS Edit: row 3, over earlier output).
+        state.alt_screen_cursor.position = state.cursor.position;
+        state.alt_screen_cursor.has_state = true;
+        break;
+    case vt_message_id::use_main_buffer:
+        if (state.alt_screen_cursor.has_state)
+        {
+            state.cursor.position = state.alt_screen_cursor.position;
+            state.alt_screen_cursor.has_state = false;
+        }
         break;
     case vt_message_id::resize_window: {
         SHORT rows = msg.payload.resize.rows;
