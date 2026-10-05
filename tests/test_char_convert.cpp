@@ -407,6 +407,23 @@ bool test_to_wchar_surrogate()
     return true;
 }
 
+bool test_utf8_incomplete_tail()
+{
+    // "│" is E2 94 82, "😀" is F0 9F 98 80.
+    ASSERT(utf8_incomplete_tail_length("") == 0);
+    ASSERT(utf8_incomplete_tail_length("AB") == 0);
+    ASSERT(utf8_incomplete_tail_length("AB\xE2") == 1);
+    ASSERT(utf8_incomplete_tail_length("AB\xE2\x94") == 2);
+    ASSERT(utf8_incomplete_tail_length("AB\xE2\x94\x82") == 0);
+    ASSERT(utf8_incomplete_tail_length("\xF0\x9F\x98") == 3);
+    ASSERT(utf8_incomplete_tail_length("\xF0\x9F\x98\x80") == 0);
+    // Continuation bytes without a lead (the end of a character split
+    // earlier) are not an unfinished character.
+    ASSERT(utf8_incomplete_tail_length("\x94\x82") == 0);
+    ASSERT(utf8_incomplete_tail_length("\x9F\x98\x80") == 0);
+    return true;
+}
+
 int main()
 {
     std::wcout << L"=== char_convert Tests ===" << std::endl;
@@ -436,6 +453,7 @@ int main()
     RUN_TEST(test_stream_decoder_3byte, L"Stream 3-byte");
     RUN_TEST(test_stream_decoder_invalid_byte, L"Stream Invalid");
     RUN_TEST(test_stream_decoder_truncated, L"Stream Truncated");
+    RUN_TEST(test_utf8_incomplete_tail, L"UTF-8 incomplete tail");
 
     RUN_TEST(test_ansi_to_u32_ascii, L"ANSI→32 ASCII");
     RUN_TEST(test_ansi_to_u32_empty, L"ANSI→32 Empty");

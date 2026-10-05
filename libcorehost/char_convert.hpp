@@ -213,6 +213,25 @@ inline void convert_utf8_to_u32(std::string_view utf8, U32Buffer &out) noexcept
     });
 }
 
+// How many bytes at the end of utf8 are an unfinished character: its lead
+// byte and the continuation bytes so far, with the rest still to come.
+inline size_t utf8_incomplete_tail_length(std::string_view utf8) noexcept
+{
+    size_t continuation = 0;
+    for (size_t i = utf8.size(); i-- > 0 && continuation < 3;)
+    {
+        const auto b = static_cast<unsigned char>(utf8[i]);
+        if ((b & 0xC0) == 0x80)
+        {
+            ++continuation;
+            continue;
+        }
+        const size_t length = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+        return continuation + 1 < length ? continuation + 1 : 0;
+    }
+    return 0;
+}
+
 template <typename WideBuffer>
 // 将 UTF-32 文本转换到调用方复用的 UTF-16/wchar_t 缓冲。
 inline void convert_u32_to_wstr(std::u32string_view u32s, WideBuffer &out) noexcept

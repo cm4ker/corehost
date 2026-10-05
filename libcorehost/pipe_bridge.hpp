@@ -1552,6 +1552,31 @@ struct pipe_bridge
         _raw_output_mid_sequence = mid;
     }
 
+    // A UTF-8 character can arrive split over two writes: ssh passes data on
+    // as the network delivers it. Returns the write's complete characters,
+    // with what the last write left unfinished in front, and keeps this
+    // write's own unfinished tail for the next one, as conhost does. Before,
+    // each half went to the model on its own and the character was lost
+    // (one column short; the terminal, fed the raw bytes, was fine).
+    std::string_view join_utf8_writes(std::string_view bytes)
+    {
+        if (!_utf8_tail.empty())
+        {
+            _utf8_join.assign(_utf8_tail);
+            _utf8_join.append(bytes);
+            bytes = _utf8_join;
+        }
+        const size_t keep = utf8_incomplete_tail_length(bytes);
+        _utf8_tail.assign(bytes.substr(bytes.size() - keep));
+        bytes.remove_suffix(keep);
+        return bytes;
+    }
+
+    bool utf8_char_pending() const noexcept
+    {
+        return !_utf8_tail.empty();
+    }
+
     // Set by mark_terminal_cursor_lost, cleared by the next CUP.
     bool _terminal_cursor_lost = false;
     // DSR CPR queries sent after terminal resizes whose replies haven't come
@@ -1562,6 +1587,9 @@ struct pipe_bridge
     // See want_cursor_sync.
     bool _cursor_sync_wanted = false;
     bool _raw_output_mid_sequence = false;
+    // See join_utf8_writes.
+    std::string _utf8_tail;
+    std::string _utf8_join;
     // 本地回显一个单列字符后推进终端光标追踪状态。
     void term_cursor_advance() noexcept
     {

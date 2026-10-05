@@ -198,25 +198,6 @@ inline bool is_line_terminator_echo(std::u32string_view text) noexcept
     return text == U"\r"sv || text == U"\n"sv || text == U"\r\n"sv;
 }
 
-// True when bytes end inside a UTF-8 character: its lead byte is there, some
-// of its continuation bytes are still to come.
-inline bool ends_inside_utf8_char(std::string_view bytes) noexcept
-{
-    size_t continuation = 0;
-    for (size_t i = bytes.size(); i-- > 0 && continuation < 3;)
-    {
-        const auto b = static_cast<unsigned char>(bytes[i]);
-        if ((b & 0xC0) == 0x80)
-        {
-            ++continuation;
-            continue;
-        }
-        const size_t length = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
-        return continuation + 1 < length;
-    }
-    return false;
-}
-
 inline bool is_printable_ascii_text(std::u32string_view text) noexcept
 {
     return std::ranges::all_of(text, [](char32_t ch) { return ch >= U' ' && ch < U'\x7f'; });
@@ -1401,6 +1382,8 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
     {
         auto &u32s = bridge.conv_u32();
         const UINT output_code_page = state.output_code_page ? state.output_code_page : CP_ACP;
+        const bool replay_utf8_to_terminal =
+            !unicode && !emit_console_attributes && (output_code_page == CP_UTF8 || output_code_page == 65001);
         {
             COREHOST_PERF_SCOPE_AMOUNT(write_console_convert, bytes);
             if (unicode)
@@ -1414,9 +1397,20 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
             else
             {
                 // 非 Unicode 路径使用当前输出代码页；0 是未初始化兜底，退回系统 ACP。
-                convert_ansi_to_u32(reinterpret_cast<const char *>(data), bytes, output_code_page, u32s,
-                                    bridge.conv_wstr());
+                std::string_view text{reinterpret_cast<const char *>(data), bytes};
+                if (output_code_page == CP_UTF8)
+                    text = bridge.join_utf8_writes(text);
+                convert_ansi_to_u32(text.data(), text.size(), output_code_page, u32s, bridge.conv_wstr());
             }
+        }
+
+        if (u32s.empty() && replay_utf8_to_terminal)
+        {
+            // The whole write was the start of a character, kept for the next
+            // write: nothing for the model yet, but the terminal gets the
+            // bytes now, as with every replayed write.
+            bridge.vt_append_str(std::string_view{reinterpret_cast<const char *>(data), bytes});
+            bridge.set_raw_output_mid_sequence(true);
         }
 
         if (!u32s.empty())
@@ -1436,8 +1430,6 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
                         ch = state.dec_to_unicode(static_cast<unsigned char>(ch));
             }
 
-            const bool replay_utf8_to_terminal =
-                !unicode && !emit_console_attributes && (output_code_page == CP_UTF8 || output_code_page == 65001);
             LOG2("[api_write_console] unicode=%d emit_attrs=%d replay=%d codepage=%u default_attr=0x%04X", unicode,
                  emit_console_attributes, replay_utf8_to_terminal, static_cast<unsigned>(output_code_page),
                  static_cast<unsigned>(state.default_attributes));
@@ -1593,10 +1585,8 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
             // a cursor query asked for in the middle of it goes out now, and
             // only if the bytes didn't stop inside a sequence or a character
             // (see pipe_bridge::want_cursor_sync).
-            bridge.set_raw_output_mid_sequence(
-                replay_utf8_to_terminal &&
-                (!output_parser.in_ground() ||
-                 ends_inside_utf8_char({reinterpret_cast<const char *>(data), static_cast<size_t>(bytes)})));
+            bridge.set_raw_output_mid_sequence(replay_utf8_to_terminal &&
+                                               (!output_parser.in_ground() || bridge.utf8_char_pending()));
             bridge.send_wanted_cursor_sync();
 
             // VT 可能仍在 bridge 缓冲中等待批量刷新；本地 cursor 状态必须在
