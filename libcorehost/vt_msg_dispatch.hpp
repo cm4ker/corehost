@@ -440,6 +440,7 @@ inline void vt_msg_apply_state(const vt_message &msg, console_state &state, scre
         // app left its cursor (MS Edit: row 3, over earlier output).
         state.alt_screen_cursor.position = state.cursor.position;
         state.alt_screen_cursor.has_state = true;
+        state.resized_in_alt_screen = false;
         break;
     case vt_message_id::use_main_buffer:
         if (state.alt_screen_cursor.has_state)

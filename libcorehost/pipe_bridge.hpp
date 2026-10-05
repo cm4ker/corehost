@@ -1519,6 +1519,39 @@ struct pipe_bridge
         _terminal.invalidate();
     }
 
+    // Ask the terminal where its cursor is and move the model there when the
+    // reply comes back, the same way as after a resize. The caller flushes.
+    void request_cursor_sync() noexcept
+    {
+        _resize_sync_cursor = active_screen_buffer().viewport.relative_position(cstate.cursor.position);
+        ++_resize_sync_outstanding;
+        vt_write_dsr_cpr();
+    }
+
+    // request_cursor_sync, sent by send_wanted_cursor_sync once the raw
+    // output is between sequences: a write in the replay path goes to the
+    // terminal as is, and a slow link (ssh) can cut it anywhere. A query sent
+    // after "ESC[23;0;" turned the rest of that sequence into text ("0t").
+    void want_cursor_sync() noexcept
+    {
+        _cursor_sync_wanted = true;
+    }
+
+    void send_wanted_cursor_sync() noexcept
+    {
+        if (!_cursor_sync_wanted || _raw_output_mid_sequence)
+            return;
+        _cursor_sync_wanted = false;
+        request_cursor_sync();
+    }
+
+    // Whether the last write left the terminal inside an escape sequence or
+    // a UTF-8 character.
+    void set_raw_output_mid_sequence(bool mid) noexcept
+    {
+        _raw_output_mid_sequence = mid;
+    }
+
     // Set by mark_terminal_cursor_lost, cleared by the next CUP.
     bool _terminal_cursor_lost = false;
     // DSR CPR queries sent after terminal resizes whose replies haven't come
@@ -1526,6 +1559,9 @@ struct pipe_bridge
     // was sent. See apply_terminal_resize.
     int _resize_sync_outstanding = 0;
     COORD _resize_sync_cursor{0, 0};
+    // See want_cursor_sync.
+    bool _cursor_sync_wanted = false;
+    bool _raw_output_mid_sequence = false;
     // 本地回显一个单列字符后推进终端光标追踪状态。
     void term_cursor_advance() noexcept
     {
@@ -2494,6 +2530,8 @@ struct pipe_bridge
             sbuf.viewport.reset_to_buffer(new_size);
             sbuf.resize(new_size);
         }
+        if (cstate.alt_screen_cursor.has_state || &screen != &sbuf)
+            cstate.resized_in_alt_screen = true;
         cstate.clamp_cursor_to_buffer();
 
         const auto cursor = screen.viewport.relative_position(cstate.cursor.position);
@@ -2511,9 +2549,8 @@ struct pipe_bridge
             complete_pending_console_input();
         }
 
-        _resize_sync_cursor = cursor;
-        ++_resize_sync_outstanding;
-        vt_write_dsr_cpr();
+        want_cursor_sync();
+        send_wanted_cursor_sync();
         vt_flush();
     }
 

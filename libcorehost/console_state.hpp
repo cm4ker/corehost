@@ -236,6 +236,12 @@ struct console_state
     // Cursor saved by an app's own ESC[?1049h, put back by ESC[?1049l the
     // way the terminal does it.
     saved_cursor alt_screen_cursor;
+    // The terminal resized while an alternate screen was up (an app's
+    // ESC[?1049h, or a second screen buffer). The terminal reflowed the main
+    // screen behind it and moved the cursor it saved for it; the model can't
+    // redo that, so leaving the alternate screen asks the terminal where the
+    // cursor went (pipe_bridge::request_cursor_sync).
+    bool resized_in_alt_screen = false;
 
     // ── DECSTBM 滚动区域 ──
     // 1-based viewport-relative 行号；scroll_region_bottom=0 表示当前 viewport

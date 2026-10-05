@@ -198,6 +198,25 @@ inline bool is_line_terminator_echo(std::u32string_view text) noexcept
     return text == U"\r"sv || text == U"\n"sv || text == U"\r\n"sv;
 }
 
+// True when bytes end inside a UTF-8 character: its lead byte is there, some
+// of its continuation bytes are still to come.
+inline bool ends_inside_utf8_char(std::string_view bytes) noexcept
+{
+    size_t continuation = 0;
+    for (size_t i = bytes.size(); i-- > 0 && continuation < 3;)
+    {
+        const auto b = static_cast<unsigned char>(bytes[i]);
+        if ((b & 0xC0) == 0x80)
+        {
+            ++continuation;
+            continue;
+        }
+        const size_t length = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+        return continuation + 1 < length;
+    }
+    return false;
+}
+
 inline bool is_printable_ascii_text(std::u32string_view text) noexcept
 {
     return std::ranges::all_of(text, [](char32_t ch) { return ch >= U' ' && ch < U'\x7f'; });
@@ -938,6 +957,19 @@ inline void consume_write_console_vt_message(vt_parser &parser, const vt_parse_r
             bridge.vt_msg_send<id>(msg);
     }
 
+    if constexpr (id == vt_message_id::use_main_buffer)
+    {
+        // The cursor saved at 1049h is stale if the terminal resized since
+        // (htop over ssh, then the window resized: the next prompt landed
+        // rows above the terminal's cursor). Ask the terminal where it put
+        // it once the rest of this write has gone out.
+        if (state.alt_screen_cursor.has_state && state.resized_in_alt_screen)
+        {
+            state.resized_in_alt_screen = false;
+            bridge.want_cursor_sync();
+        }
+    }
+
     vt_msg_apply_terminal_state<id>(msg, state, sb, emit_vt);
     parser.reset();
 }
@@ -1557,6 +1589,15 @@ inline void write_console_payload(bool unicode, const BYTE *data, ULONG bytes, c
                     }
                 }
             }
+            // The terminal got this write's raw bytes before the parser ran, so
+            // a cursor query asked for in the middle of it goes out now, and
+            // only if the bytes didn't stop inside a sequence or a character
+            // (see pipe_bridge::want_cursor_sync).
+            bridge.set_raw_output_mid_sequence(
+                replay_utf8_to_terminal &&
+                (!output_parser.in_ground() ||
+                 ends_inside_utf8_char({reinterpret_cast<const char *>(data), static_cast<size_t>(bytes)})));
+            bridge.send_wanted_cursor_sync();
 
             // VT 可能仍在 bridge 缓冲中等待批量刷新；本地 cursor 状态必须在
             // completion 前同步，供下一次 ReadConsole 使用。

@@ -873,6 +873,12 @@ class vt_parser
         _reset_parser_state_after_message();
     }
 
+    // False while the input so far stopped inside an escape sequence.
+    [[nodiscard]] bool in_ground() const noexcept
+    {
+        return _mode == parser_mode::ground;
+    }
+
   private:
     // _parse_ground_control 交付单字符控制符时的存储；payload.text 指向它。
     char32_t _ground_control_char = 0;

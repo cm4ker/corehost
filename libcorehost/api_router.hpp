@@ -85,6 +85,7 @@ struct api_router
         // screen_buffer，保证终端内容与 libcorehost 内存状态一致。
         if (alt)
         {
+            state.resized_in_alt_screen = false;
             bridge.vt_append_str("\x1b[?1049h"sv);
             bridge.vt_flush();
             vt_write_screen_snapshot();
@@ -98,6 +99,14 @@ struct api_router
         state.cursor.position = main_cursor;
         state.clamp_cursor_to_buffer();
         bridge.vt_append_str("\x1b[?1049l"sv);
+        // main_cursor is stale if the terminal resized in between (see
+        // console_state::resized_in_alt_screen).
+        if (state.resized_in_alt_screen)
+        {
+            state.resized_in_alt_screen = false;
+            bridge.want_cursor_sync();
+            bridge.send_wanted_cursor_sync();
+        }
         bridge.vt_flush();
         bridge.sync_cursor_after_write(state.cursor.position);
     }
