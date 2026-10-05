@@ -10,6 +10,7 @@
 #include "console_state.hpp"
 #include "api_handlers.hpp"
 #include <cstdio>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -1604,6 +1605,47 @@ bool test_win32_console_read_tab_inserts_tab()
     return true;
 }
 
+// Home and End as xterm sends them: CSI H and CSI F, with modifiers
+// CSI 1;<mod>H and CSI 1;<mod>F. PSReadLine selects with Shift+Home/End.
+// corehost read CSI F as Home and dropped CSI 1;<mod>H.
+bool test_vt_home_end_keys()
+{
+    struct key_case
+    {
+        const char *seq;
+        WORD vk;
+        DWORD mods;
+    };
+    const key_case cases[] = {
+        {"\x1b[H", VK_HOME, 0},
+        {"\x1b[F", VK_END, 0},
+        {"\x1b[1;2H", VK_HOME, SHIFT_PRESSED},
+        {"\x1b[1;2F", VK_END, SHIFT_PRESSED},
+        {"\x1b[1;5H", VK_HOME, LEFT_CTRL_PRESSED},
+        {"\x1b[1;5F", VK_END, LEFT_CTRL_PRESSED},
+    };
+    for (const auto &c : cases)
+    {
+        pipe_bridge_test_context ctx;
+        ctx.bridge.test_feed_raw_bytes(reinterpret_cast<const BYTE *>(c.seq), static_cast<DWORD>(std::strlen(c.seq)));
+        INPUT_RECORD recs[8]{};
+        const size_t n = ctx.input.read(recs, std::size(recs));
+        int keys_down = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const auto &ke = recs[i].Event.KeyEvent;
+            if (recs[i].EventType != KEY_EVENT || !ke.bKeyDown || ke.wVirtualKeyCode == VK_SHIFT ||
+                ke.wVirtualKeyCode == VK_CONTROL || ke.wVirtualKeyCode == VK_MENU)
+                continue;
+            ++keys_down;
+            ASSERT(ke.wVirtualKeyCode == c.vk);
+            ASSERT((ke.dwControlKeyState & (SHIFT_PRESSED | LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED)) == c.mods);
+        }
+        ASSERT(keys_down == 1);
+    }
+    return true;
+}
+
 // ==================================================================
 // ══════════════════════════════════════════════════════════════════
 // Enter 换行标志回归测试（修复 "echo hellohello" BUG）
@@ -2060,6 +2102,9 @@ int main()
     RUN_TEST(test_win32_console_read_history_navigation, L"History navigation");
     RUN_TEST(test_win32_console_read_keyup_ignored, L"KeyUp ignored");
     RUN_TEST(test_win32_console_read_tab_inserts_tab, L"Tab inserts tab");
+
+    std::wcout << L"\nVT Key Input :\n";
+    RUN_TEST(test_vt_home_end_keys, L"Home/End with modifiers");
 
     std::wcout << L"\nEnter Newline Flag Regression (echo hellohello) :\n";
     RUN_TEST(test_enter_newline_flag_set_on_cr, L"Flag set on CR");

@@ -2463,20 +2463,6 @@ struct pipe_bridge
             _write_key_event_pair(rec);
     }
 
-    // 处理键盘输入路径中的 CUP。当前只把 CUP 1;1 视为 Home 键兼容编码；
-    // 其他绝对定位序列属于终端控制，不应进入 input_buffer。
-    void process_input_cursor_position(const vt_message &msg)
-    {
-        // 某些终端把 Home 编码成 CUP 1;1。只有明确 1,1 时才作为 Home，
-        // 其他 CUP 输入在键盘路径中不产生事件。
-        if (msg.payload.position.row == 1 && msg.payload.position.col == 1)
-        {
-            INPUT_RECORD rec;
-            if (_engine.convert(vt_message_id::key_home, msg, rec))
-                _write_key_event_pair(rec);
-        }
-    }
-
     // 处理终端 CPR 响应。只有 pending inherit cursor 时才用响应更新
     // cstate.cursor；普通 CPR 响应由调用点按原始序列交还给应用。
     bool process_input_cpr_response(const vt_message &m) noexcept
@@ -2935,8 +2921,9 @@ struct pipe_bridge
                 _input_parser.reset();
                 break;
             }
+            // CSI F is End (xterm), not Home.
             case vt_message_id::cursor_prev_line: {
-                process_input_home(pending_kind, msg);
+                process_input_end(pending_kind, msg);
                 _input_parser.reset();
                 break;
             }
@@ -2953,13 +2940,16 @@ struct pipe_bridge
                 _input_parser.reset();
                 break;
             }
-            // 终端控制/响应类输入只更新 bridge 状态；不能作为用户按键回给
-            // Console API。
+            // Home: CSI H, or CSI 1;<mod>H with modifiers (Shift+Home is
+            // CSI 1;2H). The parser reads it as a CUP and has already put the
+            // second parameter in key_modifier.
             case vt_message_id::cursor_position: {
-                process_input_cursor_position(msg);
+                process_input_home(pending_kind, msg);
                 _input_parser.reset();
                 break;
             }
+            // 终端控制/响应类输入只更新 bridge 状态；不能作为用户按键回给
+            // Console API。
             case vt_message_id::resize_window: {
                 process_input_resize_window(msg);
                 _input_parser.reset();
