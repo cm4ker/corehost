@@ -1,12 +1,12 @@
 name: Build for mite
 
 # Builds corehost.exe + conpty.dll (Release, x64 and ARM64) for the mite
-# terminal. Every push to the mite branch uploads them as an artifact;
+# terminal. Every push to main uploads them as an artifact;
 # a mite-v* tag also publishes them as a release.
 
 on:
   push:
-    branches: [mite]
+    branches: [main]
     tags: ['mite-v*']
   workflow_dispatch:
 
