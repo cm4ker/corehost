@@ -2773,6 +2773,42 @@ struct pipe_bridge
         }
     }
 
+    // xterm sends F1-F4 as SS3 P..S, but with modifiers as CSI 1;<mod>P..S
+    // (Shift+F1 is CSI 1;2P). The parser reads those finals as output
+    // sequences (DCH, CPR, SU; Q is unknown), so input picks them out by
+    // their text. The modifier is already in key_modifier.
+    static vt_message_id modified_f1_to_f4(std::u32string_view seq) noexcept
+    {
+        constexpr std::u32string_view prefix = U"\x1b[1;";
+        if (seq.size() < prefix.size() + 2 || !seq.starts_with(prefix))
+            return vt_message_id::continue_;
+        for (char32_t c : seq.substr(prefix.size(), seq.size() - prefix.size() - 1))
+        {
+            if (c < U'0' || c > U'9')
+                return vt_message_id::continue_;
+        }
+        switch (seq.back())
+        {
+        case U'P':
+            return vt_message_id::key_f1;
+        case U'Q':
+            return vt_message_id::key_f2;
+        case U'R':
+            return vt_message_id::key_f3;
+        case U'S':
+            return vt_message_id::key_f4;
+        default:
+            return vt_message_id::continue_;
+        }
+    }
+
+    // corehost has asked the terminal for its cursor (DSR) and waits for
+    // the reply.
+    [[nodiscard]] bool expecting_cpr_reply() const noexcept
+    {
+        return _terminal.pending_inherit_cursor() || _resize_sync_outstanding > 0;
+    }
+
     // An app that reads VT input (ENABLE_VIRTUAL_TERMINAL_INPUT, such as
     // Windows OpenSSH's ssh.exe) gets the terminal's own characters, as from
     // conhost, instead of decoded keys. ssh.exe forwards only uChar, so
@@ -2849,6 +2885,14 @@ struct pipe_bridge
                  id == vt_message_id::cursor_forward_tab) &&
                 pending_kind == PendingKind::ConsoleRead)
                 _echo_byte(b);
+
+            if (const auto fkey = modified_f1_to_f4(parsed.raw_sequence); fkey != vt_message_id::continue_)
+            {
+                // Shift+F3 and a cursor report for row 1 look the same; while
+                // corehost waits for its own DSR reply, it is the reply.
+                if (id != vt_message_id::cpr_response || !expecting_cpr_reply())
+                    id = fkey;
+            }
 
             if (is_decoded_key(id) && vt_input_passthrough(pending_kind))
             {
@@ -3020,6 +3064,16 @@ struct pipe_bridge
             }
             case vt_message_id::key_page_down: {
                 process_input_key_event<vt_message_id::key_page_down>(msg);
+                _input_parser.reset();
+                break;
+            }
+            case vt_message_id::key_f1: {
+                process_input_key_event<vt_message_id::key_f1>(msg);
+                _input_parser.reset();
+                break;
+            }
+            case vt_message_id::key_f2: {
+                process_input_key_event<vt_message_id::key_f2>(msg);
                 _input_parser.reset();
                 break;
             }

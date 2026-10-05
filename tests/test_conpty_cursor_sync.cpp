@@ -1605,25 +1605,17 @@ bool test_win32_console_read_tab_inserts_tab()
     return true;
 }
 
-// Home and End as xterm sends them: CSI H and CSI F, with modifiers
-// CSI 1;<mod>H and CSI 1;<mod>F. PSReadLine selects with Shift+Home/End.
-// corehost read CSI F as Home and dropped CSI 1;<mod>H.
-bool test_vt_home_end_keys()
+struct vt_key_case
 {
-    struct key_case
-    {
-        const char *seq;
-        WORD vk;
-        DWORD mods;
-    };
-    const key_case cases[] = {
-        {"\x1b[H", VK_HOME, 0},
-        {"\x1b[F", VK_END, 0},
-        {"\x1b[1;2H", VK_HOME, SHIFT_PRESSED},
-        {"\x1b[1;2F", VK_END, SHIFT_PRESSED},
-        {"\x1b[1;5H", VK_HOME, LEFT_CTRL_PRESSED},
-        {"\x1b[1;5F", VK_END, LEFT_CTRL_PRESSED},
-    };
+    const char *seq;
+    WORD vk;
+    DWORD mods;
+};
+
+// Feeds each sequence to a fresh bridge with no read pending (as for
+// PSReadLine, which reads key events) and checks the one key it gives.
+bool check_vt_key_cases(std::span<const vt_key_case> cases)
+{
     for (const auto &c : cases)
     {
         pipe_bridge_test_context ctx;
@@ -1643,6 +1635,53 @@ bool test_vt_home_end_keys()
         }
         ASSERT(keys_down == 1);
     }
+    return true;
+}
+
+// Home and End as xterm sends them: CSI H and CSI F, with modifiers
+// CSI 1;<mod>H and CSI 1;<mod>F. PSReadLine selects with Shift+Home/End.
+// corehost read CSI F as Home and dropped CSI 1;<mod>H.
+bool test_vt_home_end_keys()
+{
+    const vt_key_case cases[] = {
+        {"\x1b[H", VK_HOME, 0},
+        {"\x1b[F", VK_END, 0},
+        {"\x1b[1;2H", VK_HOME, SHIFT_PRESSED},
+        {"\x1b[1;2F", VK_END, SHIFT_PRESSED},
+        {"\x1b[1;5H", VK_HOME, LEFT_CTRL_PRESSED},
+        {"\x1b[1;5F", VK_END, LEFT_CTRL_PRESSED},
+    };
+    return check_vt_key_cases(cases);
+}
+
+// F1-F4 as xterm sends them: SS3 P..S, with modifiers CSI 1;<mod>P..S.
+// corehost passed SS3 P/Q (F1, F2) and every modified F1-F4 on as plain
+// characters (Escape, '[', '1', ...).
+bool test_vt_f1_to_f4_keys()
+{
+    const vt_key_case cases[] = {
+        {"\x1bOP", VK_F1, 0},
+        {"\x1bOQ", VK_F2, 0},
+        {"\x1bOR", VK_F3, 0},
+        {"\x1bOS", VK_F4, 0},
+        {"\x1b[1;2P", VK_F1, SHIFT_PRESSED},
+        {"\x1b[1;5Q", VK_F2, LEFT_CTRL_PRESSED},
+        {"\x1b[1;2R", VK_F3, SHIFT_PRESSED},
+        {"\x1b[1;3S", VK_F4, LEFT_ALT_PRESSED},
+        {"\x1b[15;2~", VK_F5, SHIFT_PRESSED},
+    };
+    return check_vt_key_cases(cases);
+}
+
+// While corehost waits for its own cursor report, CSI 1;2R is that report
+// (row 1, column 2), not Shift+F3.
+bool test_vt_cpr_reply_not_f3()
+{
+    pipe_bridge_test_context ctx;
+    ctx.bridge.request_cursor_sync();
+    const char seq[] = "\x1b[1;2R";
+    ctx.bridge.test_feed_raw_bytes(reinterpret_cast<const BYTE *>(seq), static_cast<DWORD>(std::strlen(seq)));
+    ASSERT(ctx.input.available() == 0);
     return true;
 }
 
@@ -2105,6 +2144,8 @@ int main()
 
     std::wcout << L"\nVT Key Input :\n";
     RUN_TEST(test_vt_home_end_keys, L"Home/End with modifiers");
+    RUN_TEST(test_vt_f1_to_f4_keys, L"F1-F4 with modifiers");
+    RUN_TEST(test_vt_cpr_reply_not_f3, L"Awaited cursor report is not Shift+F3");
 
     std::wcout << L"\nEnter Newline Flag Regression (echo hellohello) :\n";
     RUN_TEST(test_enter_newline_flag_set_on_cr, L"Flag set on CR");
