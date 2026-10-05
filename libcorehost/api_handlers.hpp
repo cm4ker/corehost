@@ -1917,14 +1917,15 @@ inline bool api_set_active_sb(corehost::condrv_io::io_msg &msg, console_state &,
     return true;
 }
 
-// FlushConsoleInputBuffer：清空 input_buffer，并取消等待输入的 pending 请求。
+// FlushConsoleInputBuffer：清空 input_buffer。
 inline bool api_flush_input_buf(corehost::condrv_io::io_msg &msg, console_state &, screen_buffer &, input_buffer &inp,
-                                pipe_bridge &bridge) noexcept
+                                pipe_bridge &) noexcept
 {
-    // FlushConsoleInputBuffer 也要取消等待输入的 pending 读，否则客户端可能在
-    // 已清空队列后继续挂起。
+    // A read another client thread has pending keeps waiting for new input,
+    // as with conhost. Completing it would hand ReadConsole 0 bytes, which
+    // callers such as cmd take for end of input. (The loop used to block while
+    // a read was pending, so this request could not arrive during one.)
     inp.flush();
-    bridge.cancel_pending_read();
     ucomplete(msg);
     return true;
 }

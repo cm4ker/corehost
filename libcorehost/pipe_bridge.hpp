@@ -120,6 +120,30 @@ struct pipe_bridge
         _signal.set_pipe(pipe);
     }
 
+    // The PtySignal pipe, or an invalid view when the session has none.
+    [[nodiscard]] win32::handle_view signal_pipe() const noexcept
+    {
+        return _signal.has_pipe() ? _signal.pipe() : win32::handle_view{};
+    }
+
+    // See pipe_bridge_io::start_reader. notify runs on the reader thread.
+    bool start_vt_input_reader(void (*notify)(void *), void *context) noexcept
+    {
+        return _io.start_reader(notify, context);
+    }
+
+    void stop_vt_input_reader() noexcept
+    {
+        _io.stop_reader();
+    }
+
+    // Thread-safe. With the reader running: bytes are queued that the loop has
+    // not taken yet.
+    [[nodiscard]] bool vt_input_queued() const noexcept
+    {
+        return _io.reader_has_input();
+    }
+
     // 更新 GetConsoleProcessList 可见的进程快照。message_router 在
     // CONNECT/DISCONNECT 后把 io_state 的真实列表同步到这里。
     void set_process_list(std::span<const DWORD> processes) noexcept
@@ -1403,14 +1427,26 @@ struct pipe_bridge
             return;
     }
 
-    // 取消当前挂起读取并立即完成给 ConDrv。Flush/Disconnect 类路径用它把
-    // bridge 从 pending 状态拉回可继续 READ_IO 的状态。
-    void cancel_pending_read()
+    // A client that disconnects while its read is pending (it exited, or Ctrl+C
+    // ended it) leaves a request nobody waits for; ConDrv has cancelled it.
+    // Drop it, as conhost ends a leaving process's waits: otherwise the next
+    // input completes that dead request and is lost.
+    void drop_pending_read_of(ULONG_PTR process) noexcept
     {
-        // DISCONNECT 或外部关闭需要释放当前 ConDrv 请求；completion 的具体
-        // 形态仍由 complete_pending 根据 pending 类型决定。
-        if (_pending.has_pending())
-            complete_pending();
+        const auto *m = _pending.raw_read()       ? _pending.raw_read()
+                        : _pending.console_read() ? _pending.console_read()
+                                                  : _pending.console_input();
+        if (!m || m->descriptor.Process != process)
+            return;
+        LOG3("[bridge] drop pending read kind=%d of pid=%llu", static_cast<int>(_pending.kind()),
+             static_cast<unsigned long long>(process));
+        _pending.clear();
+        _read_total = 0;
+        _line_found = false;
+        _cooked_buf.clear();
+        _cooked_cursor = 0;
+        _input_raw_buf.clear();
+        _history.reset_browse();
     }
 
     // 直接把 Console API 文本按当前输出代码页转成 UTF-8 写入 VT 输出缓冲。

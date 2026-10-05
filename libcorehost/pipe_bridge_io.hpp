@@ -1,7 +1,11 @@
 #pragma once
 #include <windows.h>
 #include <algorithm>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <vector>
 #include "win32/handle.hpp"
 #include "condrv_io.hpp"
 #include "perf_diag.hpp"
@@ -24,6 +28,80 @@ enum class vt_pipe_read_status
 class pipe_bridge_io
 {
   public:
+    pipe_bridge_io() noexcept = default;
+    pipe_bridge_io(const pipe_bridge_io &) = delete;
+    pipe_bridge_io &operator=(const pipe_bridge_io &) = delete;
+
+    ~pipe_bridge_io() noexcept
+    {
+        stop_reader();
+    }
+
+    // Moves vt_in reads to a thread of their own: it blocks in ReadFile, queues
+    // what arrives and calls notify(context) (also once at EOF). From then on
+    // every vt_in access in this class goes through that queue.
+    //
+    // The I/O loop thread cannot wait for vt_in and ConDrv at the same time: a
+    // pipe handle is always signaled, so the loop either blocks in ReadFile
+    // (and stops serving console calls from other client threads) or polls.
+    // With the reader it can sit in READ_IO and still learn about input at
+    // once, because notify cancels that READ_IO. Without a reader (unit tests)
+    // the pipe is read directly, as before.
+    bool start_reader(void (*notify)(void *), void *context) noexcept
+    {
+        if (_reader || !_vt_input.valid())
+            return false;
+        auto reader = std::make_unique<reader_state>();
+        reader->pipe = _vt_input;
+        reader->notify = notify;
+        reader->context = context;
+        reader->data_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!reader->data_event)
+            return false;
+        reader->thread = ::CreateThread(nullptr, 0, &reader_main, reader.get(), 0, nullptr);
+        if (!reader->thread)
+        {
+            LOG("[bridge_io] vt_in reader thread not started, err=%lu", ::GetLastError());
+            ::CloseHandle(reader->data_event);
+            return false;
+        }
+        _reader = std::move(reader);
+        LOG("[bridge_io] vt_in reader started");
+        return true;
+    }
+
+    // Stops the reader thread (it may sit in ReadFile) and drops its queue.
+    // notify is never called once this returns.
+    void stop_reader() noexcept
+    {
+        if (!_reader)
+            return;
+        {
+            std::lock_guard guard{_reader->lock};
+            _reader->stop = true;
+            _reader->notify = nullptr;
+        }
+        _reader->space.notify_all();
+        while (::WaitForSingleObject(_reader->thread, 0) == WAIT_TIMEOUT)
+        {
+            // A cancel that lands before ReadFile started misses; try again.
+            ::CancelSynchronousIo(_reader->thread);
+            ::WaitForSingleObject(_reader->thread, 5);
+        }
+        ::CloseHandle(_reader->thread);
+        ::CloseHandle(_reader->data_event);
+        _reader.reset();
+    }
+
+    // Thread-safe: true when the reader holds bytes nobody has taken yet.
+    [[nodiscard]] bool reader_has_input() const noexcept
+    {
+        if (!_reader)
+            return false;
+        std::lock_guard guard{_reader->lock};
+        return _reader->queued() != 0;
+    }
+
     // 绑定 ConDrv server；后续 complete/read_input 都通过这个非拥有句柄执行。
     void set_server(win32::handle_view server) noexcept
     {
@@ -71,6 +149,12 @@ class pipe_bridge_io
     {
         // available 返回 vt_in 当前可同步读取的字节数；失败时调用方按 EOF 处理。
         available = 0;
+        if (_reader)
+        {
+            std::lock_guard guard{_reader->lock};
+            available = static_cast<DWORD>(std::min<size_t>(_reader->queued(), MAXDWORD));
+            return available != 0 || !_reader->eof;
+        }
         COREHOST_PERF_SCOPE(vt_input_peek);
         const auto result = win32::peek_named_pipe(_vt_input, available);
         if (result.success() || result.empty())
@@ -88,6 +172,8 @@ class pipe_bridge_io
         // destination 是 pipe_bridge::_readbuf 的剩余空间；本函数最多读取当前
         // PeekNamedPipe 可见字节，避免阻塞 ConDrv I/O loop。
         read_bytes = 0;
+        if (_reader)
+            return take_queued(destination, read_bytes);
 
         DWORD available = 0;
         if (!peek_available(available))
@@ -107,6 +193,17 @@ class pipe_bridge_io
         // 只在没有信号管道的路径使用；调用方接受 ReadFile 阻塞到有输入或 EOF。
         read_bytes = 0;
         LOG("[bridge_io] read blocking");
+        if (_reader)
+        {
+            // Nothing can cancel a wait on the queue the way CancelSynchronousIo
+            // cancels ReadFile, so wait one time slice and let the caller poll
+            // its signals again.
+            const auto status = take_queued(destination, read_bytes);
+            if (status != vt_pipe_read_status::empty)
+                return status;
+            ::WaitForSingleObject(_reader->data_event, blocking_slice_ms);
+            return take_queued(destination, read_bytes);
+        }
         return read_from_vt_input(destination, read_bytes);
     }
 
@@ -117,6 +214,16 @@ class pipe_bridge_io
         // 用于消费输入流中必须精确匹配的单字节后缀，例如 CR 后紧跟的 LF。
         // 只有下一个字节正好等于 expected 才读取；否则不改变 vt_in。
         consumed = {};
+        if (_reader)
+        {
+            std::lock_guard guard{_reader->lock};
+            if (_reader->queued() == 0 || _reader->bytes[_reader->head] != expected)
+                return false;
+            ++_reader->head;
+            _reader->space.notify_all();
+            consumed = expected;
+            return true;
+        }
         char8_t next = {};
         DWORD peeked = 0;
         DWORD available = 0;
@@ -152,6 +259,100 @@ class pipe_bridge_io
     }
 
   private:
+    // A full queue stops the reader, so a flood of input the client does not
+    // read still pushes back on the terminal through the pipe.
+    static constexpr size_t max_queued_bytes = 1 << 20;
+    static constexpr DWORD blocking_slice_ms = 16;
+
+    struct reader_state
+    {
+        win32::handle_view pipe;
+        HANDLE thread = nullptr;
+        // Set whenever bytes or EOF arrive; read_blocking waits on it.
+        HANDLE data_event = nullptr;
+        mutable std::mutex lock;
+        std::condition_variable space;
+        // Unread bytes are bytes[head..].
+        std::vector<char8_t> bytes;
+        size_t head = 0;
+        bool eof = false;
+        bool stop = false;
+        void (*notify)(void *) = nullptr;
+        void *context = nullptr;
+
+        [[nodiscard]] size_t queued() const noexcept
+        {
+            return bytes.size() - head;
+        }
+    };
+
+    static DWORD WINAPI reader_main(void *param) noexcept
+    {
+        auto &r = *static_cast<reader_state *>(param);
+        char8_t chunk[4096];
+        for (;;)
+        {
+            {
+                std::unique_lock guard{r.lock};
+                r.space.wait(guard, [&] { return r.stop || r.queued() < max_queued_bytes; });
+                if (r.stop)
+                    return 0;
+            }
+            const auto result = win32::read_some(r.pipe, std::span<char8_t>{chunk});
+            void (*notify)(void *) = nullptr;
+            void *context = nullptr;
+            bool eof = false;
+            {
+                std::lock_guard guard{r.lock};
+                if (r.stop)
+                    return 0;
+                if (result.success())
+                {
+                    if (r.head != 0 && r.head == r.bytes.size())
+                    {
+                        r.bytes.clear();
+                        r.head = 0;
+                    }
+                    r.bytes.insert(r.bytes.end(), chunk, chunk + result.bytes);
+                }
+                else if (!result.empty())
+                {
+                    LOG("[bridge_io] vt_in reader stops: status=%u err=%u", static_cast<unsigned>(result.status),
+                        static_cast<unsigned>(result.error));
+                    r.eof = eof = true;
+                }
+                notify = r.notify;
+                context = r.context;
+            }
+            ::SetEvent(r.data_event);
+            if (notify)
+                notify(context);
+            if (eof)
+                return 0;
+        }
+    }
+
+    // Takes queued bytes; empty when none are queued, eof once the pipe closed
+    // and the queue ran dry.
+    [[nodiscard]] vt_pipe_read_status take_queued(std::span<char8_t> destination, DWORD &read_bytes) noexcept
+    {
+        read_bytes = 0;
+        std::lock_guard guard{_reader->lock};
+        const auto n = std::min<size_t>({_reader->queued(), destination.size(), MAXDWORD});
+        if (n == 0)
+            return _reader->eof ? vt_pipe_read_status::eof : vt_pipe_read_status::empty;
+        std::copy_n(_reader->bytes.begin() + static_cast<std::ptrdiff_t>(_reader->head), n, destination.begin());
+        _reader->head += n;
+        if (_reader->head == _reader->bytes.size())
+        {
+            _reader->bytes.clear();
+            _reader->head = 0;
+        }
+        _reader->space.notify_all();
+        read_bytes = static_cast<DWORD>(n);
+        return vt_pipe_read_status::bytes;
+    }
+
     // 把 char8_t 缓冲转换成 Win32 ReadFile/condrv_io 需要的 BYTE span。
     [[nodiscard]] static std::span<BYTE> byte_span(std::span<char8_t> buffer) noexcept
     {
@@ -186,6 +387,8 @@ class pipe_bridge_io
     win32::handle_view _server;
     // 终端输入 pipe 非拥有句柄，所有 vt_in Peek/ReadFile 都集中在这里。
     win32::handle_view _vt_input;
+    // Set by start_reader: the thread that owns vt_in reads.
+    std::unique_ptr<reader_state> _reader;
 };
 
 } // namespace corehost::conpty

@@ -69,6 +69,31 @@ struct message_router
         return completed_inline;
     }
 
+    // True for a request that can wait for terminal input: RAW_READ,
+    // ReadConsole, and GetConsoleInput without CONSOLE_READ_NOWAIT. The bridge
+    // holds one waiting read at a time, so the loop must not hand it a second
+    // one while the first is pending.
+    [[nodiscard]] static bool may_wait_for_input(const corehost::condrv_io::io_msg &msg) noexcept
+    {
+        if (msg.descriptor.Function == CONSOLE_IO_RAW_READ)
+            return true;
+        if (msg.descriptor.Function != CONSOLE_IO_USER_DEFINED || msg.descriptor.InputSize < sizeof(CONSOLE_MSG_HEADER))
+            return false;
+        const auto *hdr = reinterpret_cast<const CONSOLE_MSG_HEADER *>(msg.body);
+        const auto layer = hdr->ApiNumber >> 24;
+        const auto api = hdr->ApiNumber & 0xFFFFFF;
+        if (layer != 1)
+            return false;
+        if (api == 5) // ReadConsole
+            return true;
+        if (api != 4) // GetConsoleInput
+            return false;
+        if (msg.descriptor.InputSize < sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_GETCONSOLEINPUT_MSG))
+            return true;
+        const auto *req = reinterpret_cast<const CONSOLE_GETCONSOLEINPUT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+        return (req->Flags & CONSOLE_READ_NOWAIT) == 0;
+    }
+
     // 没有新的 ConDrv 消息时推进 VT 输入和 EOF 检测。它不提交 completion，
     // 只让 bridge 有机会把终端输入转成 pending 结果或 input_buffer 事件。
     void on_idle()
@@ -193,6 +218,7 @@ struct message_router
             LOG2("dispatch consumes DISCONNECT through io_state after flushing vtOut=%zu",
                  bridge.buffered_vt_output_bytes());
             bridge.vt_flush();
+            bridge.drop_pending_read_of(msg.descriptor.Process);
             bool ok = io.handle_disconnect(msg);
             sync_process_snapshot();
             LOG2("DISCONNECT consumed ok=%d processCount=%zu bridgeProcessCount=%zu", ok, io.process_count,
