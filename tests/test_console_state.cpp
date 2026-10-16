@@ -2327,6 +2327,30 @@ bool test_ctrl_c_is_no_key_with_processed_input()
     return true;
 }
 
+bool test_written_enter_ends_cooked_read()
+{
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+
+    // libuv ends its line-mode ReadConsole by writing an Enter key with
+    // WriteConsoleInput; the waiting read must see it.
+    bridge.test_enter_console_read_mode();
+    INPUT_RECORD enter{};
+    enter.EventType = KEY_EVENT;
+    enter.Event.KeyEvent.bKeyDown = TRUE;
+    enter.Event.KeyEvent.wRepeatCount = 1;
+    enter.Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+    enter.Event.KeyEvent.uChar.UnicodeChar = L'\r';
+    ASSERT(inp.write(&enter, 1) == 1);
+    bridge.on_console_input_written();
+    ASSERT(bridge.test_get_pend_kind() == static_cast<int>(PendingKind::None));
+    ASSERT(bridge.test_console_read_msg().complete.IoStatus.Status == 0);
+    ASSERT(inp.available() == 0);
+    return true;
+}
+
 bool test_input_apis_reject_output_handle()
 {
     corehost::condrv_io::io_msg msg{};
@@ -3179,6 +3203,7 @@ int main()
     RUN_TEST(test_ctrl_c_ends_cooked_read, L"Ctrl+C ends a cooked read");
     RUN_TEST(test_ctrl_c_is_no_key_with_processed_input, L"Ctrl+C is a key only without processed input");
     RUN_TEST(test_input_apis_reject_output_handle, L"input APIs reject an output handle");
+    RUN_TEST(test_written_enter_ends_cooked_read, L"Enter from WriteConsoleInput ends a cooked read");
     RUN_TEST(test_regression_create_object_rejects_malformed_or_unknown_type,
              L"CREATE_OBJECT rejects malformed or unknown type");
     RUN_TEST(test_regression_new_output_screen_buffer_can_be_activated, L"New output screen buffer can be activated");

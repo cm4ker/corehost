@@ -157,6 +157,19 @@ struct pipe_bridge
         _processes.assign(processes, groups);
     }
 
+    // WriteConsoleInput added records. A waiting ReadConsoleInput gets them,
+    // and a waiting ReadConsole edits its line with them, as in conhost: libuv
+    // (node, bun, Claude Code) ends its line-mode ReadConsole by writing an
+    // Enter key this way, and its tty output stays locked until that read
+    // returns, so the app hung with an empty screen.
+    void on_console_input_written()
+    {
+        if (_pending.kind() == PendingKind::ConsoleInput)
+            complete_pending_console_input();
+        else if (_pending.kind() == PendingKind::ConsoleRead)
+            consume_input_buffer_for_console_read();
+    }
+
     // Sends CTRL_C_EVENT or CTRL_BREAK_EVENT to the console's processes in
     // process group `group`, or to all of them for 0, as conhost's
     // ProcessCtrlEvents does for Ctrl+C typed in the terminal and for
@@ -270,6 +283,26 @@ struct pipe_bridge
     bool _line_found = false;
     // Set while complete_pending ends a read for Ctrl+C/Ctrl+Break.
     bool _read_aborted = false;
+    // The read request a handler is serving right now. When it is done before
+    // the handler returns (input was already there), the handler returns true
+    // and the I/O loop submits the completion; complete_pending must not send
+    // it too: ConDrv failed the second COMPLETE_IO and corehost died (typing
+    // ahead in cmd, a libuv line read woken by WriteConsoleInput).
+    const corehost::condrv_io::io_msg *_serving = nullptr;
+    struct serving_guard
+    {
+        const corehost::condrv_io::io_msg *&slot;
+        serving_guard(const corehost::condrv_io::io_msg *&s, const corehost::condrv_io::io_msg &m) noexcept : slot(s)
+        {
+            slot = &m;
+        }
+        ~serving_guard()
+        {
+            slot = nullptr;
+        }
+        serving_guard(const serving_guard &) = delete;
+        serving_guard &operator=(const serving_guard &) = delete;
+    };
     // 没有 pending 时提前到达的 vt_in 字节，或当前批次完成一行后剩余的尾部。
     bizwen::deque<char8_t> _queued_vt_input;
 
@@ -1169,6 +1202,7 @@ struct pipe_bridge
     // 建立 RAW_READ pending，并尽量同步消费已经到达的 vt_in 字节。
     bool handle_raw_read(corehost::condrv_io::io_msg &msg)
     {
+        const serving_guard serving{_serving, msg};
         // RAW_READ 是 ANSI/raw byte read；Ctrl+Z 只在 ENABLE_PROCESSED_INPUT
         // 下代表 EOF。
         if (_pending.vt_eof())
@@ -1191,6 +1225,7 @@ struct pipe_bridge
     // ── ReadConsole ──
     bool handle_console_read(corehost::condrv_io::io_msg &msg, bool proc_z, const BYTE *init_data, DWORD init_bytes)
     {
+        const serving_guard serving{_serving, msg};
         // USER_DEFINED ReadConsole body 位于 CONSOLE_MSG_HEADER 后。返回时只写
         // CONSOLE_READCONSOLE_MSG 和后续文本，不把 header 回传给客户端。
         auto *req = reinterpret_cast<CONSOLE_READCONSOLE_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
@@ -1246,6 +1281,7 @@ struct pipe_bridge
     // NOWAIT 标志从 input_buffer 返回；可等待且无记录时进入 ConsoleInput pending。
     bool handle_console_input(corehost::condrv_io::io_msg &msg)
     {
+        const serving_guard serving{_serving, msg};
         // GetConsoleInput 直接服务于 input_buffer。PEEK 不消费记录；NOWAIT
         // 在没有记录时必须同步返回 0，而不是挂起。
         prepare_console_input_events();
@@ -3488,6 +3524,7 @@ struct pipe_bridge
 
         CD_IO_COMPLETE comp_before{};
         CD_IO_COMPLETE *comp_ptr = nullptr;
+        const auto *request = _pending.raw_read() ? _pending.raw_read() : _pending.console_read();
         if (_pending.kind() == PendingKind::RawRead && _pending.raw_read())
         {
             auto &m = *_pending.raw_read();
@@ -3536,7 +3573,7 @@ struct pipe_bridge
         LOG3("[bridge] complete_pending: done kind=%d cooked_len=%zu vt_eof=%d", static_cast<int>(_pending.kind()),
              _cooked_buf.size(), _pending.vt_eof());
 
-        if (comp_ptr && _io.can_complete())
+        if (comp_ptr && _io.can_complete() && request != _serving)
         {
             // 挂起请求已经从原始 READ_IO 返回 false，必须额外发送
             // CD_IO_COMPLETE；同步完成的请求则由 io_loop 直接带回。
@@ -3571,7 +3608,7 @@ struct pipe_bridge
             auto comp = m.complete;
             _pending.clear();
 
-            if (_io.can_complete())
+            if (_io.can_complete() && &m != _serving)
                 _io.complete(comp);
             return;
         }
@@ -3581,7 +3618,7 @@ struct pipe_bridge
         auto comp = m.complete;
         _pending.clear();
 
-        if (_io.can_complete())
+        if (_io.can_complete() && &m != _serving)
             _io.complete(comp);
     }
 
