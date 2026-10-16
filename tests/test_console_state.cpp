@@ -2254,6 +2254,109 @@ bool test_regression_connect_disconnect_syncs_process_snapshot()
     return true;
 }
 
+bool test_connect_reply_names_the_process()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer main_sb;
+    screen_buffer alt_sb;
+    input_buffer inp;
+    io_state io;
+    io.condrv_input = win32::duplicate_self();
+    io.condrv_output = win32::duplicate_self();
+    pipe_bridge_testable bridge{inp, st, main_sb};
+    api_router api{st, main_sb, alt_sb, inp, io, bridge};
+    message_router router{io, bridge, api};
+
+    // ConDrv tags every later message of the client, DISCONNECT included,
+    // with the Process value of the CONNECT reply; it must be per process.
+    connect_completion completion = connect_completion::explicit_complete;
+    msg.descriptor.Function = CONSOLE_IO_CONNECT;
+    msg.descriptor.Process = 22;
+    ASSERT(router.on_connect(msg, completion));
+    ASSERT(msg.complete.Write.Size == sizeof(CD_CONNECTION_INFORMATION));
+    const auto *info = static_cast<const CD_CONNECTION_INFORMATION *>(msg.complete.Write.Data);
+    ASSERT(info->Process == 22);
+    return true;
+}
+
+bool test_ctrl_c_ends_cooked_read()
+{
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    ASSERT((st.input_mode & ENABLE_PROCESSED_INPUT) != 0);
+
+    // As in conhost: ReadConsole ends with STATUS_ALERTED and no text, and
+    // ^C is not left behind as a key.
+    bridge.test_enter_console_read_mode();
+    const char8_t typed[] = u8"ab\x03";
+    bridge.test_feed_raw_bytes(typed, 3);
+    ASSERT(bridge.test_get_pend_kind() == static_cast<int>(PendingKind::None));
+    const auto &m = bridge.test_console_read_msg();
+    ASSERT(m.complete.IoStatus.Status == status_alerted);
+    const auto *req = reinterpret_cast<const CONSOLE_READCONSOLE_MSG *>(m.body + sizeof(CONSOLE_MSG_HEADER));
+    ASSERT(req->NumBytes == 0);
+    ASSERT(inp.available() == 0);
+    return true;
+}
+
+bool test_ctrl_c_is_no_key_with_processed_input()
+{
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+
+    const char8_t typed[] = u8"\x03";
+    bridge.test_feed_raw_bytes(typed, 1);
+    ASSERT(inp.available() == 0);
+
+    // Without ENABLE_PROCESSED_INPUT (PSReadLine, raw-mode apps) it is the
+    // Ctrl+C key.
+    st.input_mode &= ~ENABLE_PROCESSED_INPUT;
+    bridge.test_feed_raw_bytes(typed, 1);
+    ASSERT(inp.available() == 2);
+    INPUT_RECORD r{};
+    ASSERT(inp.read(&r, 1) == 1);
+    ASSERT(r.EventType == KEY_EVENT && r.Event.KeyEvent.bKeyDown);
+    ASSERT(r.Event.KeyEvent.wVirtualKeyCode == 'C');
+    ASSERT(r.Event.KeyEvent.uChar.UnicodeChar == 0x03);
+    ASSERT((r.Event.KeyEvent.dwControlKeyState & LEFT_CTRL_PRESSED) != 0);
+    return true;
+}
+
+bool test_input_apis_reject_output_handle()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer main_sb;
+    screen_buffer alt_sb;
+    input_buffer inp;
+    io_state io;
+    io.condrv_input = win32::duplicate_self();
+    io.condrv_output = win32::duplicate_self();
+    pipe_bridge_testable bridge{inp, st, main_sb};
+    api_router router{st, main_sb, alt_sb, inp, io, bridge};
+
+    // GetNumberOfConsoleInputEvents on stdout fails in conhost; libuv relies
+    // on that to tell a console's stdout from its stdin.
+    msg.descriptor.Object = reinterpret_cast<ULONG_PTR>(io.condrv_output.get());
+    msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_GETNUMBEROFINPUTEVENTS_MSG);
+    msg.descriptor.OutputSize = sizeof(CONSOLE_GETNUMBEROFINPUTEVENTS_MSG);
+    ASSERT(router.dispatch_L1(msg, 3));
+    ASSERT(msg.complete.IoStatus.Status == status_invalid_handle);
+
+    std::memset(&msg, 0, sizeof(msg));
+    msg.descriptor.Object = reinterpret_cast<ULONG_PTR>(io.condrv_input.get());
+    msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_GETNUMBEROFINPUTEVENTS_MSG);
+    msg.descriptor.OutputSize = sizeof(CONSOLE_GETNUMBEROFINPUTEVENTS_MSG);
+    ASSERT(router.dispatch_L1(msg, 3));
+    ASSERT(msg.complete.IoStatus.Status == 0);
+    return true;
+}
+
 bool test_regression_create_object_rejects_malformed_or_unknown_type()
 {
     corehost::condrv_io::io_msg msg{};
@@ -3072,6 +3175,10 @@ int main()
     RUN_TEST(test_regression_raw_flush_clears_input_events, L"RawFlush clears input events");
     RUN_TEST(test_regression_user_defined_router_matches_api_sorter_validation, L"USER_DEFINED router validation");
     RUN_TEST(test_regression_connect_disconnect_syncs_process_snapshot, L"CONNECT/DISCONNECT sync process snapshot");
+    RUN_TEST(test_connect_reply_names_the_process, L"CONNECT reply names the process");
+    RUN_TEST(test_ctrl_c_ends_cooked_read, L"Ctrl+C ends a cooked read");
+    RUN_TEST(test_ctrl_c_is_no_key_with_processed_input, L"Ctrl+C is a key only without processed input");
+    RUN_TEST(test_input_apis_reject_output_handle, L"input APIs reject an output handle");
     RUN_TEST(test_regression_create_object_rejects_malformed_or_unknown_type,
              L"CREATE_OBJECT rejects malformed or unknown type");
     RUN_TEST(test_regression_new_output_screen_buffer_can_be_activated, L"New output screen buffer can be activated");

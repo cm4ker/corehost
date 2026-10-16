@@ -265,7 +265,8 @@ struct message_router
     {
         // io_state 保存的是当前真实连接进程列表；bridge 保存的是 API 查询可见
         // 快照。CONNECT/DISCONNECT 后必须同步，否则 GetConsoleProcessList 会滞后。
-        bridge.set_process_list(std::span<const DWORD>{io.process_list.data(), io.process_count});
+        bridge.set_process_list(std::span<const DWORD>{io.process_list.data(), io.process_count},
+                               std::span<const DWORD>{io.process_groups.data(), io.process_count});
         LOG2("process snapshot copied count=%zu", io.process_count);
     }
 };

@@ -29,7 +29,8 @@ namespace corehost::conpty
 // CONNECT/DISCONNECT 的真实来源；bridge 只保存供 GetConsoleProcessList 读取的副本。
 void copy_process_list(io_state &io, pipe_bridge &bridge) noexcept
 {
-    bridge.set_process_list(std::span<const DWORD>{io.process_list.data(), io.process_count});
+    bridge.set_process_list(std::span<const DWORD>{io.process_list.data(), io.process_count},
+                               std::span<const DWORD>{io.process_groups.data(), io.process_count});
 }
 
 void run_conpty_session(win32::handle_view server, win32::handle_view event, win32::handle condrv_input,

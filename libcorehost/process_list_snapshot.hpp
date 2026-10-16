@@ -21,6 +21,23 @@ class process_list_snapshot
         _count = std::min(processes.size(), _processes.size());
         if (_count > 0)
             std::memcpy(_processes.data(), processes.data(), _count * sizeof(DWORD));
+        std::fill(_groups.begin(), _groups.end(), DWORD{0});
+    }
+
+    // The same, with each process's process group (0 = not known).
+    void assign(std::span<const DWORD> processes, std::span<const DWORD> groups) noexcept
+    {
+        assign(processes);
+        const auto group_count = std::min(_count, groups.size());
+        if (group_count > 0)
+            std::memcpy(_groups.data(), groups.data(), group_count * sizeof(DWORD));
+    }
+
+    // Calls f(pid, process_group) for each process, oldest first.
+    template <class F> void for_each(F &&f) const
+    {
+        for (size_t i = 0; i != _count; ++i)
+            f(_processes[i], _groups[i]);
     }
 
     // 返回快照中有效 pid 数量。
@@ -42,6 +59,8 @@ class process_list_snapshot
   private:
     // 当前控制台连接过且尚未 DISCONNECT 的 pid。
     std::array<DWORD, max_processes> _processes{};
+    // Process group of each entry in _processes, for GenerateConsoleCtrlEvent.
+    std::array<DWORD, max_processes> _groups{};
     // _processes 的有效前缀长度。
     size_t _count = 0;
 };

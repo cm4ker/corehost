@@ -38,6 +38,7 @@
 #include "pipe_bridge_io.hpp"
 #include "conversion_buffers.hpp"
 #include "process_list_snapshot.hpp"
+#include "console_ctrl.hpp"
 #include "terminal_cursor_state.hpp"
 #include "pending_io_state.hpp"
 #include "command_history_state.hpp"
@@ -151,6 +152,26 @@ struct pipe_bridge
         _processes.assign(processes);
     }
 
+    void set_process_list(std::span<const DWORD> processes, std::span<const DWORD> groups) noexcept
+    {
+        _processes.assign(processes, groups);
+    }
+
+    // Sends CTRL_C_EVENT or CTRL_BREAK_EVENT to the console's processes in
+    // process group `group`, or to all of them for 0, as conhost's
+    // ProcessCtrlEvents does for Ctrl+C typed in the terminal and for
+    // GenerateConsoleCtrlEvent.
+    void send_ctrl_event(DWORD event, DWORD group) noexcept
+    {
+        _processes.for_each([&](DWORD pid, DWORD pid_group) {
+            if (group != 0 && pid_group != group)
+                return;
+            [[maybe_unused]] const auto status = console_end_task(pid, event, cstate.console_window);
+            LOG2("ctrl event %lu to pid=%lu group=%lu status=0x%08lx", event, pid, pid_group,
+                 static_cast<unsigned long>(status));
+        });
+    }
+
     // 返回当前进程快照数量；仅用于日志和 L3 GetConsoleProcessList 响应。
     size_t process_count() const noexcept
     {
@@ -247,6 +268,8 @@ struct pipe_bridge
     DWORD _read_total = 0;
     // true 表示 process_input 已经遇到行终止符或 Ctrl+Z 并完成当前 pending 读。
     bool _line_found = false;
+    // Set while complete_pending ends a read for Ctrl+C/Ctrl+Break.
+    bool _read_aborted = false;
     // 没有 pending 时提前到达的 vt_in 字节，或当前批次完成一行后剩余的尾部。
     bizwen::deque<char8_t> _queued_vt_input;
 
@@ -2324,6 +2347,22 @@ struct pipe_bridge
     bool process_input_win32_key(PendingKind pending_kind, const vt_message &m, DWORD i, DWORD len,
                                  const char8_t *bytes)
     {
+        // Ctrl+C (only with ENABLE_PROCESSED_INPUT) and Ctrl+Break are console
+        // control events, not keys, as in conhost's WriteCtrlKey.
+        {
+            const auto &k = m.payload.win32_key;
+            const bool ctrl = (k.control_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+            const bool alt = (k.control_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+            const bool ctrl_c = k.vk == 'C' && (cstate.input_mode & ENABLE_PROCESSED_INPUT) != 0;
+            if (k.key_down && ctrl && !alt && (ctrl_c || k.vk == VK_CANCEL))
+            {
+                if (!on_ctrl_event(ctrl_c ? CTRL_C_EVENT : CTRL_BREAK_EVENT))
+                    return false;
+                queue_unprocessed_vt_input(bytes, i + 1, len);
+                return true;
+            }
+        }
+
         if (pending_kind == PendingKind::ConsoleRead)
         {
             // ConsoleRead 自己做本地行编辑，只处理 KEY_DOWN；KEY_UP 不应
@@ -2867,6 +2906,25 @@ struct pipe_bridge
         for (DWORD i = 0; i != len; ++i)
         {
             char8_t b = bytes[i];
+
+            // ── Ctrl+C ──
+            // With ENABLE_PROCESSED_INPUT, ^C is never a key: as in conhost
+            // (HandleGenericKeyEvent), it sends CTRL_C_EVENT to the console's
+            // processes and ends a waiting ReadConsole or raw read. Without
+            // it (PSReadLine, raw-mode TUIs, ssh.exe) ^C stays a key. ESC ^C
+            // is Ctrl+Alt+C, so only a ^C in ground state counts.
+            if (b == static_cast<char8_t>(0x03) && (cstate.input_mode & ENABLE_PROCESSED_INPUT) != 0 &&
+                _input_parser.in_ground()) [[unlikely]]
+            {
+                LOG3("[bridge] process_input: Ctrl+C at offset %lu kind=%d", i, static_cast<int>(_pending.kind()));
+                if (on_ctrl_event(CTRL_C_EVENT))
+                {
+                    queue_unprocessed_vt_input(bytes, i + 1, len);
+                    return;
+                }
+                continue;
+            }
+
             echo_raw_read_text_byte(b);
 
             // ── Ctrl+Z 即时检测 ──
@@ -3372,6 +3430,45 @@ struct pipe_bridge
         m.complete.Write.Size = sz;
     }
 
+    // Ctrl+C or Ctrl+Break from the terminal. A waiting ReadConsole or raw read
+    // ends with STATUS_ALERTED and no data, then the event goes to every
+    // process on the console, in that order as in conhost (TerminateRead,
+    // then ProcessCtrlEvents on unlock). GetConsoleInput keeps waiting.
+    // Returns true when a read was ended.
+    bool on_ctrl_event(DWORD event)
+    {
+        if (event == CTRL_BREAK_EVENT)
+            inp.flush();
+        const auto kind = _pending.kind();
+        const bool ends_read = kind == PendingKind::ConsoleRead || kind == PendingKind::RawRead;
+        if (ends_read)
+        {
+            _line_found = true;
+            _read_aborted = true;
+            complete_pending();
+            _read_aborted = false;
+        }
+        send_ctrl_event(event, 0);
+        return ends_read;
+    }
+
+    // Completion for a ReadConsole or raw read ended by Ctrl+C/Ctrl+Break.
+    void prepare_aborted_read_completion(corehost::condrv_io::io_msg &m, bool console_read) noexcept
+    {
+        if (!console_read)
+        {
+            corehost::condrv_io::prepare_completion(m, status_alerted, 0);
+            return;
+        }
+        auto *req = reinterpret_cast<CONSOLE_READCONSOLE_MSG *>(m.body + sizeof(CONSOLE_MSG_HEADER));
+        req->NumBytes = 0;
+        req->ControlKeyState = 0;
+        const auto sz = static_cast<ULONG>(sizeof(CONSOLE_READCONSOLE_MSG));
+        corehost::condrv_io::prepare_completion(m, status_alerted, sz);
+        m.complete.Write.Data = m.body + sizeof(CONSOLE_MSG_HEADER);
+        m.complete.Write.Size = sz;
+    }
+
     // ── complete_pending ──────────────────────────────
     void complete_pending()
     {
@@ -3394,7 +3491,10 @@ struct pipe_bridge
         if (_pending.kind() == PendingKind::RawRead && _pending.raw_read())
         {
             auto &m = *_pending.raw_read();
-            prepare_raw_read_completion(m);
+            if (_read_aborted)
+                prepare_aborted_read_completion(m, false);
+            else
+                prepare_raw_read_completion(m);
             comp_before = m.complete;
             comp_ptr = &comp_before;
         }
@@ -3403,7 +3503,10 @@ struct pipe_bridge
             auto &m = *_pending.console_read();
             // ConsoleRead 返回行编辑后的文本，而不是原始 VT 字节；退格、历史、
             // alias 等本地编辑结果都已经体现在 _cooked_buf 中。
-            prepare_console_read_completion(m);
+            if (_read_aborted)
+                prepare_aborted_read_completion(m, true);
+            else
+                prepare_console_read_completion(m);
             comp_before = m.complete;
             comp_ptr = &comp_before;
         }
@@ -3411,7 +3514,8 @@ struct pipe_bridge
         _pending.clear();
         _read_total = 0;
 
-        history_push();
+        if (!_read_aborted)
+            history_push();
 
         // completion 后所有行编辑临时状态失效；下一次 ReadConsole 重新从当前
         // cursor 和 prompt 边界建立编辑上下文。

@@ -39,6 +39,7 @@ namespace corehost::conpty
 inline constexpr LONG status_invalid_parameter = 0xC000000D;
 inline constexpr LONG status_buffer_too_small = 0xC0000023;
 inline constexpr LONG status_illegal_function = 0xC00000AF;
+inline constexpr LONG status_invalid_handle = 0xC0000008;
 inline constexpr LONG status_not_implemented = 0xC0000002;
 inline constexpr LONG status_not_supported = 0xC00000BB;
 inline constexpr UINT code_page_japanese = 932;
@@ -1892,9 +1893,11 @@ inline bool api_fill_output(corehost::condrv_io::io_msg &msg, console_state &sta
     return true;
 }
 
-// GenerateConsoleCtrlEvent：透传 Ctrl 事件到 Windows，不改变 libcorehost 内部状态。
+// GenerateConsoleCtrlEvent: the event goes to this console's processes in the
+// given process group (0 = all), as conhost does. corehost itself is not on
+// the console, so calling ::GenerateConsoleCtrlEvent here reached nobody.
 inline bool api_ctrl_event(corehost::condrv_io::io_msg &msg, console_state &, screen_buffer &, input_buffer &,
-                           pipe_bridge &) noexcept
+                           pipe_bridge &bridge) noexcept
 {
     if (msg.descriptor.InputSize < sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_CTRLEVENT_MSG))
     {
@@ -1903,7 +1906,12 @@ inline bool api_ctrl_event(corehost::condrv_io::io_msg &msg, console_state &, sc
     }
 
     auto *r = reinterpret_cast<CONSOLE_CTRLEVENT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
-    ::GenerateConsoleCtrlEvent(r->CtrlEvent, r->ProcessGroupId);
+    if (r->CtrlEvent != CTRL_C_EVENT && r->CtrlEvent != CTRL_BREAK_EVENT)
+    {
+        corehost::condrv_io::prepare_completion(msg, status_invalid_parameter);
+        return true;
+    }
+    bridge.send_ctrl_event(r->CtrlEvent, r->ProcessGroupId);
     ucomplete(msg);
     return true;
 }

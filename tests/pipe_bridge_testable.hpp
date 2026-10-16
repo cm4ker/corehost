@@ -149,6 +149,11 @@ class pipe_bridge_testable : public pipe_bridge
         _terminal.reset_bounds(prompt_col);
     }
 
+    const corehost::condrv_io::io_msg &test_console_read_msg() const noexcept
+    {
+        return _test_console_read_msg;
+    }
+
     void test_feed_raw_bytes(const BYTE *bytes, DWORD len)
     {
         process_input(reinterpret_cast<const char8_t *>(bytes), len);

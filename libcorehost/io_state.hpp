@@ -13,10 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <vector>
 #include "connect_completion.hpp"
 #include "win32/handle.hpp"
 #include "condrv_io.hpp"
 #include "ntapi/condrv.hpp"
+#include "os/Console/conmsgl1.h"
 #include "utility/log.hpp"
 
 namespace corehost::conpty
@@ -51,6 +53,16 @@ struct io_state
     ULONG_PTR output_id = 0;
     ULONG_PTR alternate_output_id = 0;
 
+    // Every object CREATE_OBJECT handed out and CLOSE_OBJECT has not closed
+    // yet. The ids above only hold the latest of each kind, so an earlier
+    // CONOUT$ still open (or one a child inherited) was otherwise unknown.
+    struct open_object
+    {
+        ULONG_PTR id;
+        object_kind kind;
+    };
+    std::vector<open_object> open_objects;
+
     // 绑定 ConDrv server 非拥有引用。真实句柄由会话入口持有，io_state 只用
     // 它创建客户端对象和 accept 首个 CONNECT。
     void set_server(win32::handle_view s) noexcept
@@ -66,11 +78,14 @@ struct io_state
     // 超过容量的新 pid 会被忽略，以避免写越界。
     static constexpr size_t max_processes = 64;
     std::array<DWORD, max_processes> process_list{};
+    // process_list[i]'s process group (CONSOLE_SERVER_MSG::ProcessGroupId),
+    // which GenerateConsoleCtrlEvent picks processes by; 0 = not known.
+    std::array<DWORD, max_processes> process_groups{};
     size_t process_count = 0;
 
     // 将 pid 加入当前控制台进程列表。重复 pid 不改变列表；超过容量时忽略
     // 新 pid，避免破坏已有 GetConsoleProcessList 快照。
-    void add_process(DWORD pid) noexcept
+    void add_process(DWORD pid, DWORD group = 0) noexcept
     {
         // pid 来自 CONNECT descriptor.Process 或 defterm 预附加进程；同一
         // 进程重复 CONNECT 时只保留一份，匹配 GetConsoleProcessList 语义。
@@ -78,7 +93,10 @@ struct io_state
         if (std::find(process_list.begin(), end, pid) != end)
             return;
         if (process_count < max_processes)
+        {
+            process_groups[process_count] = group;
             process_list[process_count++] = pid;
+        }
     }
 
     // 从当前控制台进程列表删除 pid。找不到 pid 时不改变列表；删除后数组
@@ -91,9 +109,33 @@ struct io_state
         const auto it = std::find(process_list.begin(), end, pid);
         if (it == end)
             return;
+        const auto index = it - process_list.begin();
         std::move(it + 1, end, it);
+        std::move(process_groups.begin() + index + 1,
+                  process_groups.begin() + static_cast<std::ptrdiff_t>(process_count), process_groups.begin() + index);
         --process_count;
         process_list[process_count] = 0;
+        process_groups[process_count] = 0;
+    }
+
+    // The connecting client's process group, from the CONSOLE_SERVER_MSG its
+    // CONNECT carries (kernelbase fills it in from the process parameters).
+    [[nodiscard]] DWORD connect_process_group(const corehost::condrv_io::io_msg &msg) const noexcept
+    {
+        constexpr auto offset = offsetof(CONSOLE_SERVER_MSG, ProcessGroupId);
+        if (msg.descriptor.InputSize < offset + sizeof(ULONG))
+            return 0;
+        ULONG group = 0;
+        try
+        {
+            corehost::condrv_io::read_input(server, msg.descriptor.Identifier, static_cast<ULONG>(offset),
+                                            std::span{reinterpret_cast<BYTE *>(&group), sizeof(group)});
+        }
+        catch (...)
+        {
+            return 0;
+        }
+        return group;
     }
 
     bool handle_connect(corehost::condrv_io::io_msg &msg, connect_completion &completion)
@@ -112,7 +154,7 @@ struct io_state
 
         // 同一 pid 可能重复 CONNECT；add_process 会去重，避免
         // GetConsoleProcessList 返回重复项。
-        add_process(static_cast<DWORD>(client_pid));
+        add_process(static_cast<DWORD>(client_pid), connect_process_group(msg));
         if (first_connect)
         {
             // 首个 CONNECT 需要创建 \Input/\Output，并由 accept_connection
@@ -135,7 +177,9 @@ struct io_state
             // mode. Reuse the first connection's ids; the reply must outlive
             // this call because the next READ_IO submits it.
             _joined_connection = {};
-            _joined_connection.Process = reinterpret_cast<ULONG_PTR>(condrv_input.get());
+            // The pid, as for the first connection: DISCONNECT then names the
+            // process that left, so it leaves the process list.
+            _joined_connection.Process = msg.descriptor.Process;
             _joined_connection.Input = reinterpret_cast<ULONG_PTR>(condrv_input.get());
             _joined_connection.Output = reinterpret_cast<ULONG_PTR>(condrv_output.get());
             auto &c = corehost::condrv_io::prepare_completion(msg, 0, sizeof(CD_CONNECTION_INFORMATION));
@@ -213,6 +257,10 @@ struct io_state
             corehost::condrv_io::prepare_completion(msg, 0xC000000D /* STATUS_INVALID_PARAMETER */);
             return true;
         }
+        const auto id = reinterpret_cast<ULONG_PTR>(nh.get());
+        open_objects.push_back({id, type == CD_IO_OBJECT_TYPE_CURRENT_INPUT    ? object_kind::input
+                                    : type == CD_IO_OBJECT_TYPE_CURRENT_OUTPUT ? object_kind::output
+                                                                               : object_kind::alternate_output});
         corehost::condrv_io::prepare_completion(msg, 0, reinterpret_cast<ULONG_PTR>(nh.release()));
         return true;
     }
@@ -228,6 +276,7 @@ struct io_state
             output_id = 0;
         if (id == alternate_output_id)
             alternate_output_id = 0;
+        std::erase_if(open_objects, [id](const open_object &o) { return o.id == id; });
         LOG2("CLOSE_OBJECT object=%llu inputId=%llu outputId=%llu altOutputId=%llu", id, input_id, output_id,
              alternate_output_id);
         corehost::condrv_io::prepare_completion(msg);
@@ -244,6 +293,11 @@ struct io_state
             return object_kind::output;
         if (id != 0 && id == alternate_output_id)
             return object_kind::alternate_output;
+        for (const auto &o : open_objects)
+        {
+            if (o.id == id)
+                return o.kind;
+        }
         // The first CONNECT's objects (accept_connection) are the handles
         // every attached process inherits as stdin/stdout, and their ids are
         // the handle values themselves. Without this, SetConsoleMode on

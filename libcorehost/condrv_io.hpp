@@ -166,10 +166,9 @@ inline CD_IO_COMPLETE &prepare_completion(io_msg &msg, LONG status = 0, ULONG_PT
 //   创建它们的唯一方式是 NtOpenFile/NtCreateFile，以 Server 句柄为 RootDirectory、
 //   对象名为 \Input / \Output。
 //
-// CD_CONNECTION_INFORMATION 中 Process 为何复用 Input 句柄值？
-//   ConDrv 的 PutHandle/GetHandle 最终调用 ObReferenceObjectByPointer，
-//   ULONG_PTR 只是不透明令牌。三个字段可以不互异——原版 conhost 的
-//   ProcessHandleList 也只在首次连接时创建 Process 句柄。
+// CD_CONNECTION_INFORMATION 的三个字段只是不透明令牌，ConDrv 在后续消息的
+//   descriptor.Process/Object 中原样带回。Input/Output 用客户端句柄值；
+//   Process 用客户端 pid（每个进程一个，DISCONNECT 才能指出离开的进程）。
 //
 // accept_connection() 通过出参返回客户端 I/O 句柄：
 //   调用方必须保持这些句柄存活。ConDrv 在客户端 I/O 操作时
@@ -182,7 +181,10 @@ inline void accept_connection(win32::handle_view server, io_msg &msg, win32::han
     output = condrv::create_client_handle(server, L"\\Output");
 
     CD_CONNECTION_INFORMATION conn{};
-    conn.Process = reinterpret_cast<ULONG_PTR>(input.get());
+    // ConDrv hands Process back as descriptor.Process of every later message
+    // from this client, DISCONNECT included. The client's pid makes that
+    // tell processes apart (conhost passes its per-process record).
+    conn.Process = msg.descriptor.Process;
     conn.Input = reinterpret_cast<ULONG_PTR>(input.get());
     conn.Output = reinterpret_cast<ULONG_PTR>(output.get());
 

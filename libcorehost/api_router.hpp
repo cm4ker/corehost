@@ -375,6 +375,15 @@ struct api_router
         // api==4 是 GetConsoleInput，PSReadLine 会高频轮询；不记录以免刷屏。
         if (api != 4)
             LOG2("[dispatch] L1 api=%lu", api);
+        // GetNumberOfConsoleInputEvents, ReadConsoleInput and ReadConsole
+        // need an input handle; conhost fails them on a screen buffer. libuv
+        // tells a console's stdin from its stdout by that failure: without it
+        // node took stdout for an input tty and every write failed (EPIPE).
+        if ((api == 3 || api == 4 || api == 5) && !input_handle)
+        {
+            corehost::condrv_io::prepare_completion(msg, status_invalid_handle);
+            return true;
+        }
         switch (api)
         {
         case 0:
