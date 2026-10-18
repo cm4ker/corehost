@@ -1673,6 +1673,36 @@ bool test_vt_f1_to_f4_keys()
     return check_vt_key_cases(cases);
 }
 
+// Shift+Tab as xterm sends it: CSI Z. PSReadLine steps back through the
+// completions with it. corehost passed it on as plain characters, so
+// PSReadLine got Escape (which clears the line), then typed "[Z".
+bool test_vt_back_tab_key()
+{
+    const vt_key_case cases[] = {
+        {"\x1b[Z", VK_TAB, SHIFT_PRESSED},
+    };
+    return check_vt_key_cases(cases);
+}
+
+// An app that reads VT input (Claude Code, ssh.exe) gets CSI Z itself.
+bool test_vt_back_tab_passthrough()
+{
+    pipe_bridge_test_context ctx;
+    ctx.state.input_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    const char seq[] = "\x1b[Z";
+    ctx.bridge.test_feed_raw_bytes(reinterpret_cast<const BYTE *>(seq), static_cast<DWORD>(std::strlen(seq)));
+    INPUT_RECORD recs[16]{};
+    const size_t n = ctx.input.read(recs, std::size(recs));
+    std::wstring chars;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (recs[i].EventType == KEY_EVENT && recs[i].Event.KeyEvent.bKeyDown)
+            chars.push_back(recs[i].Event.KeyEvent.uChar.UnicodeChar);
+    }
+    ASSERT(chars == L"\x1b[Z");
+    return true;
+}
+
 // While corehost waits for its own cursor report, CSI 1;2R is that report
 // (row 1, column 2), not Shift+F3.
 bool test_vt_cpr_reply_not_f3()
@@ -2146,6 +2176,8 @@ int main()
     RUN_TEST(test_vt_home_end_keys, L"Home/End with modifiers");
     RUN_TEST(test_vt_f1_to_f4_keys, L"F1-F4 with modifiers");
     RUN_TEST(test_vt_cpr_reply_not_f3, L"Awaited cursor report is not Shift+F3");
+    RUN_TEST(test_vt_back_tab_key, L"Shift+Tab (CSI Z)");
+    RUN_TEST(test_vt_back_tab_passthrough, L"CSI Z reaches VT-input apps as is");
 
     std::wcout << L"\nEnter Newline Flag Regression (echo hellohello) :\n";
     RUN_TEST(test_enter_newline_flag_set_on_cr, L"Flag set on CR");

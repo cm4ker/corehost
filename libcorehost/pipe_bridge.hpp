@@ -2602,13 +2602,14 @@ struct pipe_bridge
     }
 
     // 处理普通 Tab 输入，写入 Tab KEY_EVENT 对。
-    void process_input_tab()
+    void process_input_tab(DWORD control_key_state = 0)
     {
         INPUT_RECORD ir{};
         ir.EventType = KEY_EVENT;
         ir.Event.KeyEvent.wRepeatCount = 1;
         ir.Event.KeyEvent.wVirtualKeyCode = VK_TAB;
         ir.Event.KeyEvent.uChar.UnicodeChar = L'\t';
+        ir.Event.KeyEvent.dwControlKeyState = control_key_state;
         _write_key_event_pair(ir);
     }
 
@@ -2846,6 +2847,7 @@ struct pipe_bridge
         case vt_message_id::cursor_next_line:
         case vt_message_id::cursor_prev_line:
         case vt_message_id::cursor_position:
+        case vt_message_id::cursor_backward_tab:
         case vt_message_id::cursor_vert_absolute:
         case vt_message_id::cursor_horiz_absolute:
         case vt_message_id::key_up:
@@ -3103,6 +3105,12 @@ struct pipe_bridge
             }
             case vt_message_id::cursor_forward_tab: {
                 process_input_tab();
+                _input_parser.reset();
+                break;
+            }
+            // CSI Z is Shift+Tab (back-tab), as in conhost.
+            case vt_message_id::cursor_backward_tab: {
+                process_input_tab(SHIFT_PRESSED);
                 _input_parser.reset();
                 break;
             }
