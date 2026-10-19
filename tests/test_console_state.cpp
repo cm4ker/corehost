@@ -785,6 +785,46 @@ bool test_regression_fill_console_output_attr_preserves_current_attr()
     return true;
 }
 
+// micro (tcell) draws with a VT truecolor pen, then clears the screen on exit
+// with FillConsoleOutputAttribute + FillConsoleOutputCharacter. The erase for
+// the full-screen fill must paint with the cells' attribute, not with that
+// pen, and the pen must come back afterwards.
+bool test_regression_fullscreen_fill_erases_with_cell_attr()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+
+    HANDLE read_end{};
+    HANDLE write_end{};
+    ASSERT(::CreatePipe(&read_end, &write_end, nullptr, 1 << 16));
+    bridge.set_vt_output(win32::handle_view(write_end));
+
+    st.default_attributes = 0xF0;
+    msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_FILLCONSOLEOUTPUT_MSG);
+    auto *fill = reinterpret_cast<CONSOLE_FILLCONSOLEOUTPUT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+    fill->ElementType = CONSOLE_REAL_UNICODE;
+    fill->Element = L' ';
+    fill->Length = static_cast<ULONG>(st.screen_buffer_size.X) * static_cast<ULONG>(st.screen_buffer_size.Y);
+    fill->WriteCoord = {0, 0};
+    ASSERT(api_fill_output(msg, st, sb, inp, bridge));
+
+    char out[256]{};
+    DWORD n = 0;
+    const bool read = ::ReadFile(read_end, out, sizeof(out), &n, nullptr) != FALSE;
+    ::CloseHandle(read_end);
+    ::CloseHandle(write_end);
+    ASSERT(read);
+    ASSERT(std::string_view(out, n) == "\x1b"
+                                       "7\x1b[0m\x1b[2J\x1b[3J\x1b"
+                                       "8");
+    ASSERT(sb.attr_at({5, 5}) == 0x07);
+    ASSERT(st.default_attributes == 0xF0);
+    return true;
+}
+
 bool test_regression_ctrl_event_rejects_short_message()
 {
     corehost::condrv_io::io_msg msg{};
@@ -3125,6 +3165,7 @@ int main()
     RUN_TEST(test_regression_fill_console_output_rejects_short_message, L"FillConsoleOutput rejects short message");
     RUN_TEST(test_regression_fill_console_output_attr_preserves_current_attr,
              L"FillConsoleOutputAttribute preserves current attr");
+    RUN_TEST(test_regression_fullscreen_fill_erases_with_cell_attr, L"Full-screen fill erases with the cell attr");
     RUN_TEST(test_regression_ctrl_event_rejects_short_message, L"GenerateConsoleCtrlEvent rejects short message");
     RUN_TEST(test_regression_set_console_cp_rejects_short_message, L"SetConsoleCP rejects short message");
     RUN_TEST(test_regression_set_console_cp_updates_selected_codepage, L"SetConsoleCP updates selected codepage");

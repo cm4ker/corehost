@@ -211,6 +211,39 @@ inline bool viewport_covers_screen_buffer(const screen_buffer &sb) noexcept
     return sb.viewport.covers(sb.size);
 }
 
+// Attribute for a terminal erase that stands for the whole screen: the one
+// every cell shares, or the legacy default when they differ (.NET's
+// Console.Clear fills the characters first and the attributes after).
+inline WORD screen_erase_attr(const screen_buffer &sb) noexcept
+{
+    const WORD first = sb.attr_at({0, 0});
+    for (SHORT y = 0; y < sb.size.Y; ++y)
+        for (SHORT x = 0; x < sb.size.X; ++x)
+            if (sb.attr_at({x, y}) != first)
+                return 0x07;
+    return first;
+}
+
+// A terminal erase paints with the current SGR background, and that pen is
+// whatever the app last set through VT. micro (tcell) clears the screen with
+// FillConsoleOutput* on exit, and its light status bar colors filled the
+// whole screen. Erase with the cells' attribute instead; save/restore cursor
+// brings the app's pen back afterwards, as the partial fills already do.
+inline void begin_screen_erase(console_state &state, screen_buffer &sb, pipe_bridge &bridge, WORD attr) noexcept
+{
+    vt_message save{};
+    bridge.vt_msg_send<vt_message_id::save_cursor>(save);
+    vt_msg_apply_state<vt_message_id::save_cursor>(save, state, sb);
+    bridge.vt_write_attr(attr);
+}
+
+inline void end_screen_erase(console_state &state, screen_buffer &sb, pipe_bridge &bridge) noexcept
+{
+    vt_message restore{};
+    bridge.vt_msg_send<vt_message_id::restore_cursor>(restore);
+    vt_msg_apply_state<vt_message_id::restore_cursor>(restore, state, sb);
+}
+
 // 在 viewport 内清除一个矩形。rect 是 buffer 坐标，函数会裁剪到可见区域，
 // 并用 attr 写入空格。
 inline void clear_viewport_rect(screen_buffer &sb, WORD attr, SMALL_RECT rect) noexcept
@@ -1776,15 +1809,17 @@ inline bool api_fill_output(corehost::condrv_io::io_msg &msg, console_state &sta
     {
         // 全屏空格填充通常来自 Clear-Host/cls。ED2 清可见屏幕，ED3 请求
         // Windows Terminal 同时清 scrollback，避免滚动条拖回旧内容。
+        // The erases are not applied to the model: the fill above already
+        // did that, and applying them would recolor the cells with the pen.
         bridge.reset_enter_newline();
+        begin_screen_erase(state, sb, bridge, screen_erase_attr(sb));
         vt_message erase_display{};
         erase_display.payload.erase_mode = 2;
         bridge.vt_msg_send<vt_message_id::erase_in_display>(erase_display);
-        vt_msg_apply_state<vt_message_id::erase_in_display>(erase_display, state, sb);
         vt_message erase_scrollback{};
         erase_scrollback.payload.erase_mode = 3;
         bridge.vt_msg_send<vt_message_id::erase_in_display>(erase_scrollback);
-        vt_msg_apply_state<vt_message_id::erase_in_display>(erase_scrollback, state, sb);
+        end_screen_erase(state, sb, bridge);
         bridge.vt_flush();
     }
     else
@@ -2230,7 +2265,10 @@ inline bool api_scroll_sb(corehost::condrv_io::io_msg &msg, console_state &state
     {
         // cls 清屏使用 ED2+ED3+Home，避免把整屏滚动翻译成大量 IL/DL；
         // ED3 清掉终端 scrollback。
-        bridge.vt_append_str("\x1b[2J\x1b[3J\x1b[H"sv);
+        begin_screen_erase(state, sb, bridge, fill_attr);
+        bridge.vt_append_str("\x1b[2J\x1b[3J"sv);
+        end_screen_erase(state, sb, bridge);
+        bridge.vt_append_str("\x1b[H"sv);
         bridge.vt_flush();
         // ── 同步 state 光标和终端光标到 (0,0) ──
         state.cursor.position = {0, 0};
