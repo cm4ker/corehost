@@ -1005,6 +1005,56 @@ bool test_regression_scroll_screen_buffer_validation_and_ansi_fill()
     return true;
 }
 
+// vim deletes lines with ScrollConsoleScreenBuffer over a clip region. The
+// terminal gets DL at the top of the rows involved, in a scroll region over
+// them, with the fill's color and the margins given back; the model is
+// scrolled once.
+bool test_regression_scroll_region_delete_lines()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+
+    HANDLE read_end{};
+    HANDLE write_end{};
+    ASSERT(::CreatePipe(&read_end, &write_end, nullptr, 1 << 16));
+    bridge.set_vt_output(win32::handle_view(write_end));
+
+    const auto last_x = static_cast<SHORT>(sb.size.X - 1);
+    const auto last_y = static_cast<SHORT>(sb.size.Y - 1);
+    for (SHORT y = 0; y <= last_y; ++y)
+        sb.set_u32({0, y}, static_cast<char32_t>(U'A' + y), 0x07);
+    msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_SCROLLSCREENBUFFER_MSG);
+    auto *scroll = reinterpret_cast<CONSOLE_SCROLLSCREENBUFFER_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+    scroll->Unicode = TRUE;
+    scroll->ScrollRectangle = {0, 5, last_x, last_y};
+    scroll->ClipRectangle = {0, 2, last_x, last_y};
+    scroll->Clip = TRUE;
+    scroll->DestinationOrigin = {0, 2};
+    scroll->Fill.Char.UnicodeChar = L' ';
+    scroll->Fill.Attributes = 0x07;
+    ASSERT(api_scroll_sb(msg, st, sb, inp, bridge));
+
+    char out[256]{};
+    DWORD n = 0;
+    const bool read = ::ReadFile(read_end, out, sizeof(out), &n, nullptr) != FALSE;
+    ::CloseHandle(read_end);
+    ::CloseHandle(write_end);
+    ASSERT(read);
+    const std::string expected = "\x1b"
+                                 "7\x1b[0m\x1b[3;" +
+                                 std::to_string(last_y + 1) +
+                                 "r\x1b[3;1H\x1b[3M\x1b[1;0r\x1b"
+                                 "8";
+    ASSERT(std::string_view(out, n) == expected);
+    ASSERT(sb.at_u32({0, 2}) == U'F');
+    ASSERT(sb.at_u32({0, static_cast<SHORT>(last_y - 3)}) == static_cast<char32_t>(U'A' + last_y));
+    ASSERT(sb.at_u32({0, last_y}) == U' ');
+    return true;
+}
+
 bool test_regression_set_text_attribute_rejects_short_message()
 {
     corehost::condrv_io::io_msg msg{};
@@ -3179,6 +3229,7 @@ int main()
     RUN_TEST(test_regression_largest_window_rejects_short_message, L"LargestWindow rejects short message");
     RUN_TEST(test_regression_scroll_screen_buffer_validation_and_ansi_fill,
              L"ScrollScreenBuffer validation and ANSI fill");
+    RUN_TEST(test_regression_scroll_region_delete_lines, L"ScrollScreenBuffer deletes lines in a region");
     RUN_TEST(test_regression_set_text_attribute_rejects_short_message, L"SetTextAttribute rejects short message");
     RUN_TEST(test_regression_set_window_info_rejects_short_message, L"SetWindowInfo rejects short message");
     RUN_TEST(test_viewport_set_window_info_absolute_updates_origin_without_resizing_buffer,

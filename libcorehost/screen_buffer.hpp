@@ -539,38 +539,27 @@ struct screen_buffer
     // ScrollConsoleScreenBuffer 语义：把 sr 中与 clip 相交的内容移动到 dest，
     // 源区域未被目标覆盖的部分用 fill 填充。函数只修改内部屏幕模型，不发
     // VT；全屏纯垂直滚动会优先使用 _row_origin 环形移动。
+    // As in conhost's ScrollRegion: the offset comes from sr as given, the
+    // source is only clamped to the buffer (rows outside the clip are still
+    // copied into it), and the clip limits the fill and the destination.
+    // This used to clip the source to the clip first, and to take the offset
+    // from the clamped sr.
     void scroll(SMALL_RECT sr, SMALL_RECT clip, bool use_clip, COORD dest, char32_t fill_char, WORD fill_attr) noexcept
     {
         COREHOST_PERF_SCOPE(screen_scroll);
-        // sr 是源矩形；clip 为可写区域；dest 是源矩形左上角移动后的目标位置。
+        // int: a destination far off the buffer overflows SHORT.
+        const int dx = dest.X - sr.Left;
+        const int dy = dest.Y - sr.Top;
         _clamp(sr);
         if (!_rvalid(sr))
             return;
-        // 没有 clip 时，整个缓冲区都是可写范围；有 clip 时，源和目标都要裁剪
-        // 到 clip 内，clip 外内容保持不变。
         if (use_clip)
             _clamp(clip);
         else
             clip = {0, 0, static_cast<SHORT>(size.X - 1), static_cast<SHORT>(size.Y - 1)};
-
-        SMALL_RECT src = sr;
-        // src 是最终要复制的源区域，先取 sr 与 clip 的交集。
-        if (src.Left < clip.Left)
-            src.Left = clip.Left;
-        if (src.Top < clip.Top)
-            src.Top = clip.Top;
-        if (src.Right > clip.Right)
-            src.Right = clip.Right;
-        if (src.Bottom > clip.Bottom)
-            src.Bottom = clip.Bottom;
-        if (!_rvalid(src))
-        {
-            _fill(sr, fill_char, fill_attr);
+        if (!_rvalid(clip))
             return;
-        }
 
-        // dx/dy 是源矩形相对目标位置的偏移。
-        SHORT dx = dest.X - sr.Left, dy = dest.Y - sr.Top;
         if (dx == 0 && dy != 0 && sr.Left == 0 && sr.Top == 0 && sr.Right == size.X - 1 && sr.Bottom == size.Y - 1 &&
             clip.Left == 0 && clip.Top == 0 && clip.Right == size.X - 1 && clip.Bottom == size.Y - 1)
         {
@@ -642,75 +631,45 @@ struct screen_buffer
             return;
         }
 
-        SMALL_RECT dst = {
-            static_cast<SHORT>(src.Left + dx),
-            static_cast<SHORT>(src.Top + dy),
-            static_cast<SHORT>(src.Right + dx),
-            static_cast<SHORT>(src.Bottom + dy),
-        };
-        // 如果目标越界，反向收缩源区域，保持 src/dst 尺寸一致。
-        if (dst.Left < clip.Left)
-        {
-            SHORT a = clip.Left - dst.Left;
-            src.Left += a;
-            dst.Left = clip.Left;
-        }
-        if (dst.Top < clip.Top)
-        {
-            SHORT a = clip.Top - dst.Top;
-            src.Top += a;
-            dst.Top = clip.Top;
-        }
-        if (dst.Right > clip.Right)
-        {
-            SHORT a = dst.Right - clip.Right;
-            src.Right -= a;
-            dst.Right = clip.Right;
-        }
-        if (dst.Bottom > clip.Bottom)
-        {
-            SHORT a = dst.Bottom - clip.Bottom;
-            src.Bottom -= a;
-            dst.Bottom = clip.Bottom;
-        }
-
-        SHORT sw = src.Right - src.Left + 1;
-        SHORT sh = src.Bottom - src.Top + 1;
-        if (!_rvalid(src) || sw <= 0 || sh <= 0)
-        {
-            _fill(sr, fill_char, fill_attr);
-            return;
-        }
+        // The part of the source whose destination lies inside the clip.
+        int sl = sr.Left, st = sr.Top, sr_ = sr.Right, sb = sr.Bottom;
+        sl = std::max(sl, clip.Left - dx);
+        st = std::max(st, clip.Top - dy);
+        sr_ = std::min(sr_, clip.Right - dx);
+        sb = std::min(sb, clip.Bottom - dy);
+        const bool moves = sl <= sr_ && st <= sb;
+        const int sw = sr_ - sl + 1;
+        const int sh = sb - st + 1;
 
         // saved 保存源区域内容，避免源/目标重叠时覆盖尚未复制的行。每个
         // saved row 使用完整缓冲区宽度，便于 copy_from 按列偏移写回。
-        _scroll_saved_rows.resize(static_cast<size_t>(sh));
-        std::ranges::for_each(std::views::iota(0, static_cast<int>(sh)), [&](int y) {
-            auto &r = _rows[static_cast<size_t>(src.Top + y)];
-            auto &saved = _scroll_saved_rows[static_cast<size_t>(y)];
-            saved.reset_fill(static_cast<uint16_t>(size.X), U' ', text_attribute{fill_attr});
-            saved.copy_from(r, static_cast<uint16_t>(src.Left), 0, static_cast<uint16_t>(sw));
-        });
+        if (moves)
+        {
+            _scroll_saved_rows.resize(static_cast<size_t>(sh));
+            std::ranges::for_each(std::views::iota(0, sh), [&](int y) {
+                auto &r = _rows[static_cast<size_t>(st + y)];
+                auto &saved = _scroll_saved_rows[static_cast<size_t>(y)];
+                saved.reset_fill(static_cast<uint16_t>(size.X), U' ', text_attribute{fill_attr});
+                saved.copy_from(r, static_cast<uint16_t>(sl), 0, static_cast<uint16_t>(sw));
+            });
+        }
 
-        SMALL_RECT fr = sr;
         // Win32 scroll 会用 fill 字符填充原源矩形与 clip 的交集，然后再写回
         // 移动后的内容；这会清掉未被目标覆盖的旧区域。
-        if (fr.Left < clip.Left)
-            fr.Left = clip.Left;
-        if (fr.Top < clip.Top)
-            fr.Top = clip.Top;
-        if (fr.Right > clip.Right)
-            fr.Right = clip.Right;
-        if (fr.Bottom > clip.Bottom)
-            fr.Bottom = clip.Bottom;
+        SMALL_RECT fr = sr;
+        fr.Left = std::max(fr.Left, clip.Left);
+        fr.Top = std::max(fr.Top, clip.Top);
+        fr.Right = std::min(fr.Right, clip.Right);
+        fr.Bottom = std::min(fr.Bottom, clip.Bottom);
         if (_rvalid(fr))
             _fill(fr, fill_char, fill_attr);
 
-        std::ranges::for_each(std::views::iota(0, static_cast<int>(sh)), [&](int y) {
-            _rows[static_cast<size_t>(dst.Top + y)].copy_from(_scroll_saved_rows[static_cast<size_t>(y)], 0,
-                                                              static_cast<uint16_t>(dst.Left),
-                                                              static_cast<uint16_t>(sw));
-        });
+        if (moves)
+            std::ranges::for_each(std::views::iota(0, sh), [&](int y) {
+                _rows[static_cast<size_t>(st + dy + y)].copy_from(_scroll_saved_rows[static_cast<size_t>(y)], 0,
+                                                                  static_cast<uint16_t>(sl + dx),
+                                                                  static_cast<uint16_t>(sw));
+            });
     }
 
     // ── CHAR_INFO 行级转换 (仅 api_handlers 使用) ──

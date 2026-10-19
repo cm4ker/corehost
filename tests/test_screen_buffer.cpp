@@ -198,6 +198,38 @@ bool test_scroll_fill_uses_fill_char()
     return true;
 }
 
+// As in conhost: the clip limits where the scroll writes, not what it reads,
+// so source rows above the clip still move into it.
+bool test_scroll_copies_source_from_outside_clip()
+{
+    screen_buffer sb({8, 10});
+    for (SHORT y = 0; y < 10; ++y)
+        sb.set_u32({0, y}, static_cast<char32_t>(U'A' + y), 0x07);
+    SMALL_RECT sr{0, 0, 7, 9};
+    SMALL_RECT clip{0, 3, 7, 9};
+    sb.scroll(sr, clip, true, {0, 2}, U'.', 0x07);
+    ASSERT_EQ(sb.at_u32({0, 2}), U'C');
+    ASSERT_EQ(sb.at_u32({0, 3}), U'B');
+    ASSERT_EQ(sb.at_u32({0, 4}), U'C');
+    ASSERT_EQ(sb.at_u32({0, 9}), U'H');
+    return true;
+}
+
+// The offset comes from the rectangle as given, before it is clamped to the
+// buffer: rows 0..4 of sr{-2..4} land at dest.Y + 2.
+bool test_scroll_offset_from_unclamped_source()
+{
+    screen_buffer sb({8, 10});
+    for (SHORT y = 0; y < 10; ++y)
+        sb.set_u32({0, y}, static_cast<char32_t>(U'A' + y), 0x07);
+    SMALL_RECT sr{0, -2, 7, 4};
+    sb.scroll(sr, sr, false, {0, 3}, U'.', 0x07);
+    ASSERT_EQ(sb.at_u32({0, 4}), U'.');
+    ASSERT_EQ(sb.at_u32({0, 5}), U'A');
+    ASSERT_EQ(sb.at_u32({0, 9}), U'E');
+    return true;
+}
+
 bool test_scroll_fill_row_write_and_readback()
 {
     screen_buffer sb({8, 2});
@@ -374,6 +406,8 @@ int main()
     RUN_TEST(test_scroll_down, L"scroll down");
     RUN_TEST(test_scroll_noop, L"scroll noop");
     RUN_TEST(test_scroll_fill_uses_fill_char, L"scroll fill char");
+    RUN_TEST(test_scroll_copies_source_from_outside_clip, L"scroll copies source from outside the clip");
+    RUN_TEST(test_scroll_offset_from_unclamped_source, L"scroll offset from the unclamped source");
     RUN_TEST(test_scroll_fill_row_write_and_readback, L"scroll fill row write/readback");
     RUN_TEST(test_single_width_row_promotes_for_wide_glyph, L"single-width row promotes for wide glyph");
     RUN_TEST(test_fill_char_replaces_wide_glyph, L"fill char replaces wide glyph");

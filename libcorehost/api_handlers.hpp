@@ -2202,6 +2202,108 @@ inline bool api_largest_window(corehost::condrv_io::io_msg &msg, console_state &
     return true;
 }
 
+// A ScrollConsoleScreenBuffer that is not a full-screen clear, on the
+// terminal; the model is already scrolled. Whole rows moving inside the clip
+// go out as IL/DL in a scroll region over the rows involved, which moves
+// whatever the terminal shows. Anything else (a sideways move, part of a row,
+// a gap between source and destination, a fill char, an underline or reverse
+// fill) is repainted from the model. This used to send IL/DL at the source's
+// bottom row with the clip as the region: rows moved the wrong way or not at
+// all, and the model was scrolled a second time.
+inline void send_partial_scroll(console_state &state, screen_buffer &sb, pipe_bridge &bridge,
+                                const CONSOLE_SCROLLSCREENBUFFER_MSG &r, char32_t fill_char, WORD fill_attr) noexcept
+{
+    const auto last_x = static_cast<SHORT>(sb.size.X - 1);
+    const auto last_y = static_cast<SHORT>(sb.size.Y - 1);
+    const auto clamp = [&](SMALL_RECT a, const SMALL_RECT &to) {
+        a.Left = std::max(a.Left, to.Left);
+        a.Top = std::max(a.Top, to.Top);
+        a.Right = std::min(a.Right, to.Right);
+        a.Bottom = std::min(a.Bottom, to.Bottom);
+        return a;
+    };
+    // Clamped and offset the way screen_buffer::scroll does it (int: a
+    // destination far off the buffer overflows SHORT).
+    const SMALL_RECT buffer{0, 0, last_x, last_y};
+    const SMALL_RECT src = clamp(r.ScrollRectangle, buffer);
+    const SMALL_RECT clip = r.Clip ? clamp(r.ClipRectangle, buffer) : buffer;
+    if (src.Left > src.Right || src.Top > src.Bottom || clip.Left > clip.Right || clip.Top > clip.Bottom)
+        return;
+    const int dx = r.DestinationOrigin.X - r.ScrollRectangle.Left;
+    const int dy = r.DestinationOrigin.Y - r.ScrollRectangle.Top;
+    const int rows = dy < 0 ? -dy : dy;
+    const int top = std::max(std::min<int>(src.Top, src.Top + dy), static_cast<int>(clip.Top));
+    const int bottom = std::min(std::max<int>(src.Bottom, src.Bottom + dy), static_cast<int>(clip.Bottom));
+    const bool whole_rows = dx == 0 && dy != 0 && src.Left == 0 && src.Right == last_x && clip.Left == 0 &&
+                            clip.Right == last_x && clip.Top <= src.Top && src.Bottom <= clip.Bottom &&
+                            rows <= src.Bottom - src.Top + 1 && top < bottom && fill_char == U' ' &&
+                            (fill_attr & 0xFF00) == 0;
+
+    vt_message save{};
+    bridge.vt_msg_send<vt_message_id::save_cursor>(save);
+    vt_msg_apply_state<vt_message_id::save_cursor>(save, state, sb);
+    if (whole_rows)
+    {
+        // The inserted rows take the SGR background, so set the fill's.
+        bridge.vt_write_attr(fill_attr);
+        vt_message region{};
+        region.payload.scroll_region.top = static_cast<short>(top + 1);
+        region.payload.scroll_region.bottom = static_cast<short>(bottom + 1);
+        bridge.vt_msg_send<vt_message_id::set_scrolling_region>(region);
+        vt_message cup{};
+        cup.payload.position.row = static_cast<short>(top + 1);
+        cup.payload.position.col = 1;
+        bridge.vt_msg_send<vt_message_id::cursor_position>(cup);
+        vt_message lines{};
+        lines.payload.count.value = static_cast<short>(std::min(rows, bottom - top + 1));
+        if (dy > 0)
+            bridge.vt_msg_send<vt_message_id::insert_lines>(lines);
+        else
+            bridge.vt_msg_send<vt_message_id::delete_lines>(lines);
+        // Give the app its own margins back (none: the whole screen).
+        vt_message margins{};
+        margins.payload.scroll_region.top = state.scroll_region_top;
+        margins.payload.scroll_region.bottom = state.scroll_region_bottom;
+        bridge.vt_msg_send<vt_message_id::set_scrolling_region>(margins);
+    }
+    else
+    {
+        WORD last_attr = 0xFFFF;
+        const auto repaint = [&](SMALL_RECT area) {
+            area = clamp(area, clip);
+            for (SHORT y = area.Top; y <= area.Bottom; ++y)
+            {
+                vt_message cup{};
+                cup.payload.position.row = static_cast<short>(y + 1);
+                cup.payload.position.col = static_cast<short>(area.Left + 1);
+                bridge.vt_msg_send<vt_message_id::cursor_position>(cup);
+                for (SHORT x = area.Left; x <= area.Right; ++x)
+                {
+                    const COORD c{x, y};
+                    // The second column of a wide glyph comes with the first.
+                    if (sb.glyph_width(c) == 0)
+                        continue;
+                    if (sb.attr_at(c) != last_attr)
+                    {
+                        last_attr = sb.attr_at(c);
+                        bridge.vt_write_attr(last_attr);
+                    }
+                    bridge.vt_write_cell(sb.at_u32(c));
+                }
+            }
+        };
+        const auto shift = [](SHORT v, int by) {
+            return static_cast<SHORT>(std::clamp<int>(v + by, SHRT_MIN, SHRT_MAX));
+        };
+        repaint(src);
+        repaint({shift(src.Left, dx), shift(src.Top, dy), shift(src.Right, dx), shift(src.Bottom, dy)});
+    }
+    vt_message restore{};
+    bridge.vt_msg_send<vt_message_id::restore_cursor>(restore);
+    vt_msg_apply_state<vt_message_id::restore_cursor>(restore, state, sb);
+    bridge.vt_flush();
+}
+
 // ScrollConsoleScreenBuffer：更新本地 screen_buffer 的矩形滚动结果，并重绘当前
 // viewport。
 inline bool api_scroll_sb(corehost::condrv_io::io_msg &msg, console_state &state, screen_buffer &sb, input_buffer &,
@@ -2277,50 +2379,8 @@ inline bool api_scroll_sb(corehost::condrv_io::io_msg &msg, console_state &state
     }
     else
     {
-        // 局部滚动用临时 scroll region 约束终端影响范围，并在结束后恢复光标。
-        vt_message m_save{};
-        bridge.vt_msg_send<vt_message_id::save_cursor>(m_save);
-
-        SMALL_RECT cr = r->Clip
-                            ? r->ClipRectangle
-                            : SMALL_RECT{0, 0, static_cast<SHORT>(sb.size.X - 1), static_cast<SHORT>(sb.size.Y - 1)};
-        vt_message m_region{};
-        m_region.payload.scroll_region.top = static_cast<short>(cr.Top + 1);
-        m_region.payload.scroll_region.bottom = static_cast<short>(cr.Bottom + 1);
-        bridge.vt_msg_send<vt_message_id::set_scrolling_region>(m_region);
-        vt_msg_apply_state<vt_message_id::set_scrolling_region>(m_region, state, sb);
-
-        vt_message m_cup{};
-        m_cup.payload.position.row = static_cast<short>(sr.Bottom + 1);
-        m_cup.payload.position.col = static_cast<short>(sr.Left + 1);
-        bridge.vt_msg_send<vt_message_id::cursor_position>(m_cup);
-
-        SHORT dy = r->DestinationOrigin.Y - sr.Top;
-        // dy<0 表示目标在上方，需要插入行把内容向下推；dy>0 则删除行。
-        if (dy < 0)
-        {
-            vt_message m_il{};
-            m_il.payload.count.value = -dy;
-            bridge.vt_msg_send<vt_message_id::insert_lines>(m_il);
-            vt_msg_apply_state<vt_message_id::insert_lines>(m_il, state, sb);
-        }
-        else if (dy > 0)
-        {
-            vt_message m_dl{};
-            m_dl.payload.count.value = dy;
-            bridge.vt_msg_send<vt_message_id::delete_lines>(m_dl);
-            vt_msg_apply_state<vt_message_id::delete_lines>(m_dl, state, sb);
-        }
-
-        vt_message m_reset{};
-        m_reset.payload.scroll_region.top = 1;
-        m_reset.payload.scroll_region.bottom = 0;
-        bridge.vt_msg_send<vt_message_id::set_scrolling_region>(m_reset);
-
-        vt_message m_restore{};
-        bridge.vt_msg_send<vt_message_id::restore_cursor>(m_restore);
-        bridge.vt_flush();
-    } // end else (!full_screen_scroll)
+        send_partial_scroll(state, sb, bridge, *r, fill_char, fill_attr);
+    }
 
     ucomplete(msg);
     return true;
