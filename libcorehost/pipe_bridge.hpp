@@ -773,6 +773,45 @@ struct pipe_bridge
         _vt_output.append_cell(ch);
     }
 
+    // Writes cells [left, right] of row y at the terminal cursor. A wide glyph
+    // goes out once, from its first column (sending each column's char printed
+    // it twice and pushed the rest of the row right); a half cut off by either
+    // end of the span goes out as a space. last_attr is the SGR the terminal
+    // has, 0xFFFF when unknown.
+    void vt_write_cells(const screen_buffer &sb, SHORT y, SHORT left, SHORT right, WORD &last_attr) noexcept
+    {
+        for (SHORT x = left; x <= right; ++x)
+        {
+            const COORD c{x, y};
+            const int width = sb.glyph_width(c);
+            if (width == 0 && x != left)
+                continue;
+            const WORD attr = sb.attr_at(c);
+            if (attr != last_attr)
+            {
+                vt_write_attr(attr);
+                last_attr = attr;
+            }
+            vt_write_cell(width == 0 || x + width - 1 > right ? U' ' : sb.at_u32(c));
+        }
+    }
+
+    // Repaints row y over [left, right], clamped to the buffer and widened to
+    // whole glyphs, after a CUP. For callers whose viewport is the buffer.
+    void vt_repaint_cells(const screen_buffer &sb, SHORT y, SHORT left, SHORT right, WORD &last_attr) noexcept
+    {
+        left = std::max<SHORT>(left, 0);
+        right = std::min<SHORT>(right, static_cast<SHORT>(sb.size.X - 1));
+        if (y < 0 || y >= sb.size.Y || left > right)
+            return;
+        while (left > 0 && sb.glyph_width({left, y}) == 0)
+            --left;
+        while (right + 1 < sb.size.X && sb.glyph_width({static_cast<SHORT>(right + 1), y}) == 0)
+            ++right;
+        vt_write_cup(y, left);
+        vt_write_cells(sb, y, left, right, last_attr);
+    }
+
     // 清空宿主终端可见屏幕并移动到左上角。
     void vt_write_clear_screen() noexcept
     {
@@ -2781,16 +2820,7 @@ struct pipe_bridge
         for (SHORT y = 0; y != new_size.Y; ++y)
         {
             vt_write_cup(y, 0);
-            for (SHORT x = 0; x != new_size.X; ++x)
-            {
-                WORD attr = active_screen.attr_at({x, y});
-                if (attr != last_attr)
-                {
-                    vt_write_attr(attr);
-                    last_attr = attr;
-                }
-                vt_write_cell(active_screen.at_u32({x, y}));
-            }
+            vt_write_cells(active_screen, y, 0, static_cast<SHORT>(new_size.X - 1), last_attr);
         }
         vt_write_cup_buffer(cstate.cursor.position);
         vt_flush();

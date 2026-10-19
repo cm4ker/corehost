@@ -378,6 +378,137 @@ bool test_ci_roundtrip()
     return true;
 }
 
+// A wide glyph's halves both carry its char, told apart by
+// COMMON_LVB_LEADING_BYTE/TRAILING_BYTE, as from conhost's ReadConsoleOutput
+// and ReadConsoleOutputAttribute. The model itself never keeps the flags.
+bool test_ci_marks_wide_glyph_halves()
+{
+    screen_buffer sb({8, 1});
+    sb.set_u32({0, 0}, U'a', 0x07);
+    sb.set_u32({1, 0}, U'你', 0x1E);
+    CHAR_INFO ci[8]{};
+    sb.row_to_ci(0, ci);
+    ASSERT_EQ(ci[0].Attributes, (WORD)0x07);
+    ASSERT_EQ(ci[1].Char.UnicodeChar, L'你');
+    ASSERT_EQ(ci[1].Attributes, (WORD)(0x1E | COMMON_LVB_LEADING_BYTE));
+    ASSERT_EQ(ci[2].Char.UnicodeChar, L'你');
+    ASSERT_EQ(ci[2].Attributes, (WORD)(0x1E | COMMON_LVB_TRAILING_BYTE));
+    ASSERT_EQ(ci[3].Attributes, (WORD)0x07);
+
+    WORD attrs[4]{};
+    ASSERT_EQ(sb.read_attrs_linear({0, 0}, attrs, 4), (size_t)4);
+    ASSERT_EQ(attrs[0], (WORD)0x07);
+    ASSERT_EQ(attrs[1], (WORD)(0x1E | COMMON_LVB_LEADING_BYTE));
+    ASSERT_EQ(attrs[2], (WORD)(0x1E | COMMON_LVB_TRAILING_BYTE));
+
+    sb.set_attr({4, 0}, 0x0317);
+    ASSERT_EQ(sb.attr_at({4, 0}), (WORD)0x17);
+    return true;
+}
+
+// WriteConsoleOutput's rules for flagged cells, from conhost: a leading half
+// writes the glyph over two columns, a trailing half only its attribute
+// unless it is the write's first cell, where it restores the whole glyph one
+// column to the left.
+bool test_ci_write_follows_wide_glyph_flags()
+{
+    screen_buffer sb({10, 6});
+    for (SHORT y = 0; y < 6; ++y)
+        for (SHORT x = 0; x < 10; ++x)
+            sb.set_u32({x, y}, static_cast<char32_t>(U'0' + x), 0x07);
+    const CHAR_INFO a{{L'a'}, 0x07};
+    const CHAR_INFO b{{L'b'}, 0x07};
+    const CHAR_INFO lead{{L'你'}, 0x0102};
+    const CHAR_INFO trail{{L'你'}, 0x0204};
+
+    const CHAR_INFO lone_trail[3] = {a, trail, b};
+    sb.row_from_ci(0, lone_trail, 3);
+    ASSERT_EQ(sb.at_u32({1, 0}), U'1');
+    ASSERT_EQ(sb.attr_at({1, 0}), (WORD)0x04);
+    sb.row_from_ci(0, &lead, 1, 9);
+    ASSERT_EQ(sb.at_u32({9, 0}), U' ');
+
+    const CHAR_INFO trail_first[2] = {trail, b};
+    sb.row_from_ci(1, trail_first, 2, 3);
+    ASSERT_EQ(sb.at_u32({2, 1}), U'你');
+    ASSERT_EQ(sb.glyph_width({2, 1}), 2);
+    ASSERT_EQ(sb.attr_at({2, 1}), (WORD)0x07);
+    ASSERT_EQ(sb.attr_at({3, 1}), (WORD)0x04);
+    ASSERT_EQ(sb.at_u32({4, 1}), U'b');
+    sb.row_from_ci(2, trail_first, 2);
+    ASSERT_EQ(sb.at_u32({0, 2}), U' ');
+    ASSERT_EQ(sb.glyph_width({0, 2}), 1);
+
+    const CHAR_INFO lead_last[2] = {a, lead};
+    sb.row_from_ci(3, lead_last, 2);
+    ASSERT_EQ(sb.at_u32({1, 3}), U'你');
+    ASSERT_EQ(sb.glyph_width({1, 3}), 2);
+    ASSERT_EQ(sb.attr_at({2, 3}), (WORD)0x07);
+    ASSERT_EQ(sb.at_u32({3, 3}), U'3');
+
+    const CHAR_INFO pair[2] = {lead, trail};
+    sb.row_from_ci(4, pair, 2, 1);
+    CHAR_INFO ci[10]{};
+    sb.row_to_ci(4, ci);
+    ASSERT_EQ(ci[1].Attributes, (WORD)0x0102);
+    ASSERT_EQ(ci[2].Attributes, (WORD)0x0204);
+    ASSERT_EQ(ci[3].Char.UnicodeChar, L'3');
+
+    const CHAR_INFO lone_lead[3] = {a, lead, b};
+    sb.row_from_ci(5, lone_lead, 3);
+    ASSERT_EQ(sb.at_u32({1, 5}), U' ');
+    ASSERT_EQ(sb.at_u32({2, 5}), U'b');
+    ASSERT_EQ(sb.glyph_width({2, 5}), 1);
+    return true;
+}
+
+// Overwriting half of a wide glyph blanks the other half, as in conhost. An
+// overwritten leading half left the glyph's char in the trailing column, a
+// write ending where a wide glyph starts took that glyph's trailing half,
+// and a wide glyph written over narrow ones kept their text in its own.
+bool test_overwrite_half_of_wide_glyph_blanks_other_half()
+{
+    screen_buffer sb({8, 3});
+    const std::u32string two = U"你好";
+    sb.write_char32_linear({0, 0}, two.data(), two.size());
+    sb.write_char32_linear({1, 0}, U"Q", 1);
+    ASSERT_EQ(sb.at_u32({0, 0}), U' ');
+    ASSERT_EQ(sb.at_u32({1, 0}), U'Q');
+    ASSERT_EQ(sb.at_u32({2, 0}), U'好');
+    ASSERT_EQ(sb.glyph_width({2, 0}), 2);
+
+    sb.write_char32_linear({0, 1}, two.data(), two.size());
+    sb.write_char32_linear({0, 1}, U"Q", 1);
+    ASSERT_EQ(sb.at_u32({1, 1}), U' ');
+    ASSERT_EQ(sb.glyph_width({1, 1}), 1);
+    ASSERT_EQ(sb.at_u32({2, 1}), U'好');
+
+    sb.write_char32_linear({0, 2}, U"abc", 3);
+    sb.set_attr({1, 2}, 0x2E);
+    sb.write_char32_linear({0, 2}, U"你", 1);
+    ASSERT(sb.glyph_at({0, 2}) == std::u32string_view{U"你"});
+    ASSERT_EQ(sb.attr_at({1, 2}), (WORD)0x2E);
+    ASSERT_EQ(sb.at_u32({2, 2}), U'c');
+    return true;
+}
+
+// ReadConsoleOutputCharacterW gives one char per glyph, and a half cut off by
+// either end of the read comes back as a space, as from conhost.
+bool test_read_wchars_linear_one_per_glyph()
+{
+    screen_buffer sb({8, 1});
+    const std::u32string text = U"a你好" U"b";
+    sb.write_char32_linear({0, 0}, text.data(), text.size());
+    wchar_t out[8]{};
+    ASSERT_EQ(sb.read_wchars_linear({0, 0}, out, 6), (size_t)4);
+    ASSERT(std::wstring_view(out, 4) == L"a你好" L"b");
+    ASSERT_EQ(sb.read_wchars_linear({2, 0}, out, 3), (size_t)2);
+    ASSERT(std::wstring_view(out, 2) == L" 好");
+    ASSERT_EQ(sb.read_wchars_linear({2, 0}, out, 2), (size_t)2);
+    ASSERT(std::wstring_view(out, 2) == L"  ");
+    return true;
+}
+
 // ==================================================================
 // Test Runner
 // ==================================================================
@@ -411,6 +542,10 @@ int main()
     RUN_TEST(test_scroll_fill_row_write_and_readback, L"scroll fill row write/readback");
     RUN_TEST(test_single_width_row_promotes_for_wide_glyph, L"single-width row promotes for wide glyph");
     RUN_TEST(test_fill_char_replaces_wide_glyph, L"fill char replaces wide glyph");
+    RUN_TEST(test_ci_marks_wide_glyph_halves, L"CHAR_INFO marks wide glyph halves");
+    RUN_TEST(test_ci_write_follows_wide_glyph_flags, L"CHAR_INFO write follows wide glyph flags");
+    RUN_TEST(test_overwrite_half_of_wide_glyph_blanks_other_half, L"overwriting half a wide glyph blanks the other half");
+    RUN_TEST(test_read_wchars_linear_one_per_glyph, L"read_wchars_linear: one char per glyph");
 
     RUN_TEST(test_clear, L"clear");
     RUN_TEST(test_clear_cell, L"clear_cell");

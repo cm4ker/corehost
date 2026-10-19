@@ -38,7 +38,10 @@ struct text_attribute
     WORD legacy = 0x07;
 
     text_attribute() noexcept = default;
-    explicit text_attribute(WORD attr) noexcept : legacy(attr)
+    // COMMON_LVB_LEADING_BYTE/TRAILING_BYTE are never stored: a read derives
+    // them from the glyph layout, and conhost drops them from any attribute
+    // it is given.
+    explicit text_attribute(WORD attr) noexcept : legacy(static_cast<WORD>(attr & ~COMMON_LVB_SBCSDBCS))
     {
     }
     operator WORD() const noexcept
@@ -309,65 +312,32 @@ struct screen_buffer_row
             }
         }
         _single_width_layout = false;
-        // 如果 col 落在旧双宽 glyph 的 trailing 半列，必须先解除旧宽字符的列
-        // 关系，否则新 glyph 会和旧 leading 列共享偏移。
-        _unwrap_glyph(col);
-
-        uint16_t old_start = col_offset(col);
-        // old_end 是被替换 glyph 在 _text 中的结束偏移；用下一个非 trailing
-        // 列的 offset 推导，最后一列由 _columns[width()] sentinel 支持。
-        uint16_t old_end = old_start;
-        {
-            uint16_t scan = col + 1;
-            while (scan < width() && is_trailing(scan))
-                ++scan;
-            old_end = (scan <= width()) ? col_offset(scan) : static_cast<uint16_t>(_text.size());
-        }
+        // A wide glyph cut by either end of the write is blanked first, so
+        // [col, end_col) holds whole glyphs and their text is replaced as one
+        // range. Replacing only the glyph at col left the other glyphs a wide
+        // write covered in _text, read back as part of the new glyph, and an
+        // overwritten leading half left its char in the trailing column.
+        const auto end_col = static_cast<uint16_t>(col + width_columns);
+        _blank_glyph_cut_at(col);
+        _blank_glyph_cut_at(end_col);
 
         // text.size() 必须能放入 OFFSET_MASK；当前屏幕模型把每个 glyph 的
         // codepoint 序列嵌在一行 _text 中，offset 只有 15 位可用。
-        uint16_t new_len = static_cast<uint16_t>(text.size());
-        // 替换 _text 中 [old_start, old_end) 为 text。replace 后，后续所有
-        // 非 trailing 列的 offset 都要按 delta 平移。
-        if (old_end > _text.size())
-            old_end = static_cast<uint16_t>(_text.size());
-        if (old_start > old_end)
-            old_start = old_end;
+        const auto old_start = col_offset(col);
+        const auto old_end = col_offset(end_col);
+        const auto new_len = static_cast<uint16_t>(text.size());
+        _text.replace(old_start, old_end - old_start, text.data(), new_len);
+        const auto delta = static_cast<int16_t>(new_len) - static_cast<int16_t>(old_end - old_start);
 
-        _text.replace(old_start, old_end - old_start, reinterpret_cast<const char32_t *>(text.data()), new_len);
+        // leading 列指向新文本，后续列设置 TRAILING_FLAG 并指向同一个 offset；
+        // end_col 之后的列（含 trailing 列和 sentinel）按 delta 平移。
+        _columns[col] = old_start;
+        for (auto c = static_cast<uint16_t>(col + 1); c < end_col; ++c)
+            _columns[c] = static_cast<uint16_t>(old_start | TRAILING_FLAG);
+        _shift_columns_from(end_col, delta);
 
-        int16_t delta = static_cast<int16_t>(new_len) - static_cast<int16_t>(old_end - old_start);
-
-        // 更新 _columns 中 >= col 且非 trailing 的条目的偏移量。trailing 列
-        // 没有自己的文本起点，稍后按新宽度重新标记。
-        for (uint16_t c = col; c <= width(); ++c)
-        {
-            if (c == col || !is_trailing(c))
-            {
-                auto &off = _columns[c];
-                uint16_t raw = off & OFFSET_MASK;
-                if (c == col)
-                    raw = old_start; // leading column 始终指向 old_start
-                else if (raw >= old_end && c > col)
-                    raw = static_cast<uint16_t>(raw + delta);
-                off = (off & TRAILING_FLAG) | raw;
-            }
-        }
-
-        // 设置宽度标记：leading 列保留普通 offset，后续列设置 TRAILING_FLAG
-        // 并指向同一个 offset。
-        for (int w = 1; w < width_columns; ++w)
-        {
-            uint16_t tc = static_cast<uint16_t>(col + w);
-            _columns[tc] = _columns[col] | TRAILING_FLAG;
-        }
-
-        // 设置属性
-        for (int w = 0; w < width_columns; ++w)
-            set_attr(static_cast<uint16_t>(col + w), attr);
-
-        // 修复 past-the-end 偏移
-        _columns[width()] = static_cast<uint16_t>(_text.size());
+        for (auto c = col; c < end_col; ++c)
+            set_attr(c, attr);
     }
 
     // 在新文本的列布局与旧布局完全一致时原地替换 _text。这个路径不移动
@@ -560,30 +530,21 @@ struct screen_buffer_row
             return;
 
         COREHOST_PERF_SCOPE_AMOUNT(row_write_generic, text.size());
-        _unwrap_glyph(col);
+        // Wide glyphs cut by either end of the run are blanked, as in
+        // write_glyph. Unwrapping the glyph at end_col instead also took the
+        // trailing half from a glyph that starts there and isn't overwritten.
         const auto end_col = static_cast<uint16_t>(col + total_columns);
-        if (end_col < width())
-            _unwrap_glyph(end_col);
+        _blank_glyph_cut_at(col);
+        _blank_glyph_cut_at(end_col);
 
         const auto old_start = col_offset(col);
-        const auto old_end = end_col <= width() ? col_offset(end_col) : static_cast<uint16_t>(_text.size());
+        const auto old_end = col_offset(end_col);
         const auto old_len = static_cast<uint16_t>(old_end >= old_start ? old_end - old_start : 0);
         const auto new_len = static_cast<uint16_t>(text.size());
 
         _text.replace(old_start, old_len, text.data(), new_len);
         const auto delta = static_cast<int16_t>(new_len) - static_cast<int16_t>(old_len);
-
-        for (uint16_t c = end_col; c <= width(); ++c)
-        {
-            if (c == width() || !is_trailing(c))
-            {
-                auto &off = _columns[c];
-                uint16_t raw = off & OFFSET_MASK;
-                if (raw >= old_end)
-                    raw = static_cast<uint16_t>(raw + delta);
-                off = (off & TRAILING_FLAG) | raw;
-            }
-        }
+        _shift_columns_from(end_col, delta);
 
         uint16_t cell = col;
         uint16_t text_offset = old_start;
@@ -662,34 +623,78 @@ struct screen_buffer_row
             {
                 // char32_t → wchar_t (取首字符, 单宽度情况下一个 cluster 通常只有一个 BMP 字符)
                 // 若 cluster 有多个 char32_t (含代理对/ZWJ), 仅取首字符填入 CHAR_INFO
-                // 第二列若是 trailing 填 0x0000 (由 DbcsAttr 标记)
+                // Both halves of a wide glyph carry its char, as in conhost;
+                // the flags below tell them apart.
                 ci.Char.UnicodeChar = static_cast<wchar_t>((gv[0] <= 0xFFFF) ? gv[0] : 0xFFFD);
             }
             else
             {
                 ci.Char.UnicodeChar = L' ';
             }
-            ci.Attributes = attr_at(col).legacy;
+            ci.Attributes = static_cast<WORD>(attr_at(col).legacy | dbcs_flags(col));
         }
+    }
+
+    // COMMON_LVB_LEADING_BYTE or COMMON_LVB_TRAILING_BYTE for the first and
+    // the second column of a wide glyph, 0 elsewhere: what conhost reports
+    // for a cell in ReadConsoleOutput and ReadConsoleOutputAttribute.
+    WORD dbcs_flags(uint16_t col) const noexcept
+    {
+        if (is_trailing(col))
+            return COMMON_LVB_TRAILING_BYTE;
+        if (col + 1 < width() && is_trailing(static_cast<uint16_t>(col + 1)))
+            return COMMON_LVB_LEADING_BYTE;
+        return 0;
     }
 
     // ── 从 CHAR_INFO 数组导入 ──
     // 从 Win32 CHAR_INFO 写回内部行状态。CHAR_INFO 只能携带单个 UTF-16
     // code unit，因此无法恢复完整 grapheme；dst_col 是目标起始列。
+    // Wide glyphs follow conhost's WriteConsoleOutput: a cell with
+    // COMMON_LVB_LEADING_BYTE writes the glyph over two columns even when the
+    // write ends there (a space when the row has no room). A cell with
+    // COMMON_LVB_TRAILING_BYTE only sets its attribute, except as the first
+    // cell of the write, where it puts the whole glyph back one column to the
+    // left (or a space in column 0), so a saved rectangle whose left edge cut
+    // a wide glyph restores it. Every cell keeps its attribute.
     void from_char_info(const CHAR_INFO *src, uint16_t count, uint16_t dst_col = 0) noexcept
     {
         materialize_filled();
         for (uint16_t i = 0; i < count && dst_col + i < width(); ++i)
         {
+            const auto col = static_cast<uint16_t>(dst_col + i);
+            const text_attribute attr{src[i].Attributes};
+            const bool leading = (src[i].Attributes & COMMON_LVB_LEADING_BYTE) != 0;
+            const bool trailing = !leading && (src[i].Attributes & COMMON_LVB_TRAILING_BYTE) != 0;
             wchar_t wch = src[i].Char.UnicodeChar;
-            if (wch == 0)
+            if (wch == 0 && !leading && !trailing)
                 continue; // trailing 标记, 跳过
             // CHAR_INFO 不携带完整 surrogate pair；孤立 high surrogate 不能直接
             // 进入 char32_t 屏幕模型，使用替换字符。
             char32_t cp = (wch >= 0xD800 && wch <= 0xDBFF) ? 0xFFFD // 孤立 UTF-16 high surrogate
+                          : wch == 0                       ? U' '
                                                            : static_cast<char32_t>(wch);
-            write_glyph(static_cast<uint16_t>(dst_col + i), std::u32string_view{&cp, 1}, 1,
-                        text_attribute{src[i].Attributes});
+            const std::u32string_view glyph{&cp, 1};
+            if (leading && col + 1 < width())
+            {
+                const auto next_attr = attr_at(static_cast<uint16_t>(col + 1));
+                write_glyph(col, glyph, 2, attr);
+                set_attr(static_cast<uint16_t>(col + 1), next_attr);
+            }
+            else if (trailing && i != 0)
+            {
+                set_attr(col, attr);
+            }
+            else if (trailing && col > 0)
+            {
+                const auto prev_attr = attr_at(static_cast<uint16_t>(col - 1));
+                write_glyph(static_cast<uint16_t>(col - 1), glyph, 2, prev_attr);
+                set_attr(col, attr);
+            }
+            else
+            {
+                write_glyph(col, leading || trailing ? std::u32string_view{U" "} : glyph, 1, attr);
+            }
         }
     }
 
@@ -753,28 +758,38 @@ struct screen_buffer_row
         std::fill(_attrs.begin() + start, _attrs.begin() + end, attr);
     }
 
-    // 解除 col 所在旧 glyph 的 trailing 关系。写入新 glyph 前必须让被覆盖
-    // 边界两侧不再共享旧 offset，否则新旧宽字符会互相污染列映射。
-    void _unwrap_glyph(uint16_t col) noexcept
+    // If col is a trailing column, turns its wide glyph into one space per
+    // column (attributes kept), so col becomes a glyph boundary. A write that
+    // starts or ends at col overwrites only part of that glyph, and conhost
+    // blanks the rest.
+    void _blank_glyph_cut_at(uint16_t col) noexcept
     {
-        uint16_t w = width();
-        if (col >= w)
+        if (col >= width() || !is_trailing(col))
             return;
+        auto lead = col;
+        while (lead > 0 && is_trailing(lead))
+            --lead;
+        auto end = static_cast<uint16_t>(col + 1);
+        while (end < width() && is_trailing(end))
+            ++end;
+        const auto start = col_offset(lead);
+        const auto stop = col_offset(end);
+        const auto columns = static_cast<uint16_t>(end - lead);
+        _text.replace(start, stop - start, columns, U' ');
+        for (auto c = lead; c != end; ++c)
+            _columns[c] = static_cast<uint16_t>(start + (c - lead));
+        _shift_columns_from(end, static_cast<int16_t>(columns - (stop - start)));
+    }
 
-        if (is_trailing(col))
+    // Moves the _text offsets of columns [from, width()] (trailing columns and
+    // the past-the-end sentinel included) by delta after a _text replace
+    // before them.
+    void _shift_columns_from(uint16_t from, int16_t delta) noexcept
+    {
+        for (auto c = from; c <= width(); ++c)
         {
-            uint16_t scan = col;
-            while (scan < w && is_trailing(scan))
-            {
-                _columns[scan] &= OFFSET_MASK;
-                ++scan;
-            }
-            return;
-        }
-
-        for (uint16_t scan = static_cast<uint16_t>(col + 1); scan < w && is_trailing(scan); ++scan)
-        {
-            _columns[scan] &= OFFSET_MASK;
+            auto &off = _columns[c];
+            off = static_cast<uint16_t>((off & TRAILING_FLAG) | ((off & OFFSET_MASK) + delta));
         }
     }
 };

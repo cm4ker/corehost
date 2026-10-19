@@ -24,16 +24,8 @@ inline void render_visible_viewport(console_state &state, screen_buffer &sb, pip
     {
         // 每行显式移动到 viewport-relative 行首，避免依赖终端自动换行状态。
         bridge.vt_write_cup(static_cast<SHORT>(y - view.Top), 0);
-        for (SHORT x = view.Left; x <= view.Right && x < sb.size.X; ++x)
-        {
-            const WORD cell_attr = sb.attr_at({x, y});
-            if (cell_attr != last_attr)
-            {
-                bridge.vt_write_attr(cell_attr);
-                last_attr = cell_attr;
-            }
-            bridge.vt_write_cell(sb.at_u32({x, y}));
-        }
+        bridge.vt_write_cells(sb, y, view.Left, std::min<SHORT>(view.Right, static_cast<SHORT>(sb.size.X - 1)),
+                              last_attr);
     }
 
     // 还原到 Console API 认为的当前 cursor，而不是停在 snapshot 最后一格。

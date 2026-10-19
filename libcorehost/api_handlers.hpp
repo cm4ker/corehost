@@ -2272,25 +2272,7 @@ inline void send_partial_scroll(console_state &state, screen_buffer &sb, pipe_br
         const auto repaint = [&](SMALL_RECT area) {
             area = clamp(area, clip);
             for (SHORT y = area.Top; y <= area.Bottom; ++y)
-            {
-                vt_message cup{};
-                cup.payload.position.row = static_cast<short>(y + 1);
-                cup.payload.position.col = static_cast<short>(area.Left + 1);
-                bridge.vt_msg_send<vt_message_id::cursor_position>(cup);
-                for (SHORT x = area.Left; x <= area.Right; ++x)
-                {
-                    const COORD c{x, y};
-                    // The second column of a wide glyph comes with the first.
-                    if (sb.glyph_width(c) == 0)
-                        continue;
-                    if (sb.attr_at(c) != last_attr)
-                    {
-                        last_attr = sb.attr_at(c);
-                        bridge.vt_write_attr(last_attr);
-                    }
-                    bridge.vt_write_cell(sb.at_u32(c));
-                }
-            }
+                bridge.vt_repaint_cells(sb, y, area.Left, area.Right, last_attr);
         };
         const auto shift = [](SHORT v, int by) {
             return static_cast<SHORT>(std::clamp<int>(v + by, SHRT_MIN, SHRT_MAX));
@@ -2404,10 +2386,11 @@ inline bool api_set_text_attr(corehost::condrv_io::io_msg &msg, console_state &s
         corehost::condrv_io::prepare_completion(msg, status_invalid_parameter);
         return true;
     }
-    state.default_attributes = r->Attributes;
+    // conhost drops COMMON_LVB_LEADING_BYTE/TRAILING_BYTE from the pen too.
+    const auto attr = static_cast<WORD>(r->Attributes & ~COMMON_LVB_SBCSDBCS);
+    state.default_attributes = attr;
     LOG2("[api_set_text_attr] attr=0x%04X", static_cast<unsigned>(r->Attributes));
     vt_message m{};
-    WORD attr = r->Attributes;
     set_sgr_from_win32_attr(m, attr);
     bridge.vt_msg_send<vt_message_id::sgr>(m);
     vt_msg_apply_state<vt_message_id::sgr>(m, state, sb);
@@ -2499,6 +2482,7 @@ inline bool api_read_output_string(corehost::condrv_io::io_msg &msg, console_sta
                                              sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG));
         auto maxn = data_capacity / sizeof(WORD);
         r->NumRecords = static_cast<ULONG>(sb.read_attrs_linear(r->ReadCoord, out, maxn));
+        std::fill(out + r->NumRecords, out + maxn, WORD{0});
     }
     else if (r->StringType == CONSOLE_ASCII)
     {
@@ -2511,7 +2495,10 @@ inline bool api_read_output_string(corehost::condrv_io::io_msg &msg, console_sta
         auto cp = state.output_code_page ? state.output_code_page : CP_ACP;
         int bytes = ::WideCharToMultiByte(cp, 0, wbuf.data(), static_cast<int>(wchar_count), out,
                                           static_cast<int>(maxb), nullptr, nullptr);
+        // Text that doesn't fit (UTF-8 takes 3 bytes for a 2-cell glyph)
+        // reads as nothing, as in conhost.
         r->NumRecords = bytes > 0 ? static_cast<ULONG>(bytes) : 0;
+        std::memset(out + r->NumRecords, 0, maxb - r->NumRecords);
     }
     else
     {
@@ -2519,7 +2506,10 @@ inline bool api_read_output_string(corehost::condrv_io::io_msg &msg, console_sta
                                                 sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG));
         auto maxn = data_capacity / sizeof(wchar_t);
         r->NumRecords = static_cast<ULONG>(sb.read_wchars_linear(r->ReadCoord, out, maxn));
+        std::fill(out + r->NumRecords, out + maxn, L'\0');
     }
+    // The whole buffer goes back to the client; past NumRecords it is zeros,
+    // as from conhost, not what earlier messages left in the shared buffer.
     ucomplete_sz(msg, static_cast<ULONG>(sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG) + data_capacity));
     return true;
 }
@@ -2633,19 +2623,38 @@ inline bool api_write_console_output(corehost::condrv_io::io_msg &msg, console_s
     }
     if (!r->Unicode)
     {
+        // As in conhost: a DBCS lead byte with another cell after it in the
+        // row converts together with that cell's byte, and both cells get the
+        // char with the leading/trailing flags (replacing any the app set).
+        // Other bytes convert alone.
         auto &unicode_data = bridge.conv_char_info();
         const auto cell_count = static_cast<size_t>(w) * static_cast<size_t>(h);
-        unicode_data.clear();
-        unicode_data.reserve(cell_count);
+        unicode_data.assign(data, data + cell_count);
         const auto cp = state.output_code_page ? state.output_code_page : CP_ACP;
-        std::transform(data, data + cell_count, std::back_inserter(unicode_data), [cp](const CHAR_INFO &ci) {
-            auto converted = ci;
-            auto ch = static_cast<char>(ci.Char.AsciiChar);
-            wchar_t wc = L' ';
-            ::MultiByteToWideChar(cp, MB_USEGLYPHCHARS, &ch, 1, &wc, 1);
-            converted.Char.UnicodeChar = wc;
-            return converted;
-        });
+        for (size_t row_start = 0; row_start < cell_count; row_start += static_cast<size_t>(w))
+        {
+            for (size_t i = row_start; i < row_start + static_cast<size_t>(w); ++i)
+            {
+                auto &ci = unicode_data[i];
+                ci.Attributes &= ~COMMON_LVB_SBCSDBCS;
+                const char ch = ci.Char.AsciiChar;
+                wchar_t wc = L' ';
+                if (i + 1 < row_start + static_cast<size_t>(w) && ::IsDBCSLeadByteEx(cp, static_cast<BYTE>(ch)))
+                {
+                    const char pair[2] = {ch, unicode_data[i + 1].Char.AsciiChar};
+                    ::MultiByteToWideChar(cp, 0, pair, 2, &wc, 1);
+                    ci.Char.UnicodeChar = wc;
+                    ci.Attributes |= COMMON_LVB_LEADING_BYTE;
+                    auto &trail = unicode_data[++i];
+                    trail.Char.UnicodeChar = wc;
+                    trail.Attributes = static_cast<WORD>((trail.Attributes & ~COMMON_LVB_SBCSDBCS) |
+                                                         COMMON_LVB_TRAILING_BYTE);
+                    continue;
+                }
+                ::MultiByteToWideChar(cp, MB_USEGLYPHCHARS, &ch, 1, &wc, 1);
+                ci.Char.UnicodeChar = wc;
+            }
+        }
         data = unicode_data.data();
     }
 
@@ -2684,30 +2693,16 @@ inline bool api_write_console_output(corehost::condrv_io::io_msg &msg, console_s
         return true;
     }
     // WriteConsoleOutput 不移动应用光标。终端侧保存光标后按格子重绘，再恢复。
+    // A wide glyph can reach a column past either side of the rectangle (a
+    // leading half on its right edge, a trailing half on its left) and a
+    // glyph cut by the rectangle is blanked there, so those columns are
+    // repainted too.
     vt_message m{};
     bridge.vt_msg_send<vt_message_id::save_cursor>(m);
-
+    WORD last_attr = 0xFFFF;
     for (SHORT y = clipped.Top; y <= clipped.Bottom; ++y)
-    {
-        m = vt_message{};
-        m.payload.position.row = static_cast<short>(y + 1);
-        m.payload.position.col = static_cast<short>(clipped.Left + 1);
-        bridge.vt_msg_send<vt_message_id::cursor_position>(m);
-
-        for (SHORT x = clipped.Left; x <= clipped.Right; ++x)
-        {
-            // 当前实现逐格写 SGR+text，保证每个 CHAR_INFO 属性都能反映到终端；
-            // 后续可在这里合并连续相同属性的 run。
-            m = vt_message{};
-            set_sgr_from_win32_attr(m, sb.attr_at({x, y}));
-            bridge.vt_msg_send<vt_message_id::sgr>(m);
-
-            char32_t ch = sb.at_u32({x, y});
-            m = vt_message{};
-            m.payload.text = std::u32string_view{&ch, 1};
-            bridge.vt_msg_send<vt_message_id::text>(m);
-        }
-    }
+        bridge.vt_repaint_cells(sb, y, static_cast<SHORT>(clipped.Left - 1), static_cast<SHORT>(clipped.Right + 1),
+                                last_attr);
 
     m = vt_message{};
     bridge.vt_msg_send<vt_message_id::restore_cursor>(m);
@@ -2888,15 +2883,44 @@ inline bool api_read_console_output(corehost::condrv_io::io_msg &msg, console_st
         }
         else
         {
+            // conhost's conversion: a wide glyph with both halves in the
+            // rectangle becomes the code page's two bytes for it (one byte and
+            // 0 when it has a single-byte char, 0 and 0 when it needs more), a
+            // leading half on the right edge becomes a space without its flag,
+            // and a trailing half on the left edge keeps the low byte of its
+            // char. Other cells take one byte, 0 when the char needs more.
             const auto cp = state.output_code_page ? state.output_code_page : CP_ACP;
             for (SHORT x = clipped.Left; x <= clipped.Right; ++x)
             {
-                auto &src = tmp[static_cast<size_t>(x)];
-                char mb = ' ';
-                ::WideCharToMultiByte(cp, 0, &src.Char.UnicodeChar, 1, &mb, 1, nullptr, nullptr);
+                const auto &src = tmp[static_cast<size_t>(x)];
                 auto &out = dst[x - clipped.Left];
-                out.Char.AsciiChar = mb;
                 out.Attributes = src.Attributes;
+                if (src.Attributes & COMMON_LVB_TRAILING_BYTE)
+                {
+                    out.Char.AsciiChar = static_cast<CHAR>(src.Char.UnicodeChar & 0xFF);
+                    continue;
+                }
+                const bool leading = (src.Attributes & COMMON_LVB_LEADING_BYTE) != 0;
+                if (leading && x == clipped.Right)
+                {
+                    out.Char.AsciiChar = ' ';
+                    out.Attributes &= ~COMMON_LVB_SBCSDBCS;
+                    continue;
+                }
+                char bytes[8]{};
+                const int n = ::WideCharToMultiByte(cp, 0, &src.Char.UnicodeChar, 1, bytes, sizeof(bytes), nullptr,
+                                                    nullptr);
+                if (!leading)
+                {
+                    out.Char.AsciiChar = n == 1 ? bytes[0] : 0;
+                    continue;
+                }
+                const bool fits = n == 1 || n == 2;
+                out.Char.AsciiChar = fits ? bytes[0] : 0;
+                ++x;
+                auto &trail = dst[x - clipped.Left];
+                trail.Char.AsciiChar = fits ? bytes[1] : 0;
+                trail.Attributes = tmp[static_cast<size_t>(x)].Attributes;
             }
         }
     }

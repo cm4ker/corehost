@@ -374,8 +374,13 @@ struct screen_buffer
                 cw = 1;
             if (cw > 2)
                 cw = 2;
+            // WriteConsoleOutputCharacter leaves every cell's attribute as
+            // it was, a wide glyph's second column included.
+            const auto next_attr = rr.attr_at(static_cast<uint16_t>(x + 1));
             rr.write_glyph(static_cast<uint16_t>(x), std::u32string_view{chars + w, 1}, cw,
                            rr.attr_at(static_cast<uint16_t>(x)));
+            if (cw == 2)
+                rr.set_attr(static_cast<uint16_t>(x + 1), next_attr);
             x += static_cast<SHORT>(cw);
             ++w;
         }
@@ -399,8 +404,13 @@ struct screen_buffer
                     cw = 1;
                 if (cw > 2)
                     cw = 2;
+                // WriteConsoleOutputCharacter leaves every cell's attribute
+                // as it was, a wide glyph's second column included.
+                const auto next_attr = row(y).attr_at(static_cast<uint16_t>(x + 1));
                 row(y).write_glyph(static_cast<uint16_t>(x), std::u32string_view{chars + w, 1}, cw,
                                    row(y).attr_at(static_cast<uint16_t>(x)));
+                if (cw == 2)
+                    row(y).set_attr(static_cast<uint16_t>(x + 1), next_attr);
                 x += static_cast<SHORT>(cw);
                 ++w;
             }
@@ -468,20 +478,31 @@ struct screen_buffer
 
     // 按线性顺序导出 wchar_t。内部非 BMP 或多 codepoint glyph 会降级为首
     // 个可表示字符/替换字符；返回写入 out 的元素数。
+    // ReadConsoleOutputCharacterW reads max_len cells and, as in conhost,
+    // gives one wchar_t per glyph: a wide glyph's second column adds nothing,
+    // and a half cut off by either end of the read comes back as a space.
     size_t read_wchars_linear(COORD start, wchar_t *out, size_t max_len) const noexcept
     {
         if (!_valid(start))
             return 0;
         size_t r = 0;
-        for (SHORT y = start.Y; y < size.Y && r < max_len; ++y)
+        size_t cells = 0;
+        for (SHORT y = start.Y; y < size.Y && cells < max_len; ++y)
         {
-            SHORT x = (y == start.Y) ? start.X : 0;
-            while (x < size.X && r < max_len)
+            const auto &rr = row(y);
+            for (SHORT x = (y == start.Y) ? start.X : 0; x < size.X && cells < max_len; ++x, ++cells)
             {
-                auto gv = row(y).glyph_at(static_cast<uint16_t>(x));
-                out[r] = gv.empty() ? L' ' : static_cast<wchar_t>(gv[0] <= 0xFFFF ? gv[0] : 0xFFFD);
-                ++r;
-                ++x;
+                const auto col = static_cast<uint16_t>(x);
+                const auto flags = rr.dbcs_flags(col);
+                if ((flags & COMMON_LVB_TRAILING_BYTE) && cells != 0)
+                    continue;
+                if (flags != 0 && ((flags & COMMON_LVB_TRAILING_BYTE) || cells + 1 == max_len))
+                {
+                    out[r++] = L' ';
+                    continue;
+                }
+                auto gv = rr.glyph_at(col);
+                out[r++] = gv.empty() ? L' ' : static_cast<wchar_t>(gv[0] <= 0xFFFF ? gv[0] : 0xFFFD);
             }
         }
         return r;
@@ -507,6 +528,7 @@ struct screen_buffer
     }
 
     // 按线性顺序导出属性。每个可见列导出一个 WORD，trailing 列也独立导出。
+    // The halves of a wide glyph carry COMMON_LVB_LEADING_BYTE/TRAILING_BYTE.
     size_t read_attrs_linear(COORD start, WORD *out, size_t max_len) const noexcept
     {
         if (!_valid(start))
@@ -517,7 +539,9 @@ struct screen_buffer
             SHORT x = (y == start.Y) ? start.X : 0;
             while (x < size.X && r < max_len)
             {
-                out[r] = row(y).attr_at(static_cast<uint16_t>(x)).legacy;
+                const auto &rr = row(y);
+                out[r] = static_cast<WORD>(rr.attr_at(static_cast<uint16_t>(x)).legacy |
+                                           rr.dbcs_flags(static_cast<uint16_t>(x)));
                 ++r;
                 ++x;
             }

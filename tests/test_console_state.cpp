@@ -1686,6 +1686,149 @@ bool test_regression_write_output_string_linear_and_ansi_count()
     return true;
 }
 
+// ReadConsoleOutputA gives a wide glyph as the code page's lead and trail
+// bytes with the flags kept, as conhost does. A leading half on the
+// rectangle's right edge reads as a space, a trailing half on its left edge
+// as the low byte of its char.
+bool test_regression_read_console_output_a_wide_glyph()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb{{4, 1}};
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    st.output_code_page = 936;
+    sb.set_u32({0, 0}, U'a', 0x07);
+    sb.set_u32({1, 0}, U'喜', 0x07); // CF B2 in GBK
+
+    const auto read = [&](SMALL_RECT region) {
+        std::memset(&msg, 0, sizeof(msg));
+        msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_READCONSOLEOUTPUT_MSG);
+        msg.descriptor.OutputSize = sizeof(CONSOLE_READCONSOLEOUTPUT_MSG) + 4 * sizeof(CHAR_INFO);
+        auto *r = reinterpret_cast<CONSOLE_READCONSOLEOUTPUT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+        r->Unicode = FALSE;
+        r->CharRegion = region;
+        api_read_console_output(msg, st, sb, inp, bridge);
+        return reinterpret_cast<const CHAR_INFO *>(msg.body + sizeof(CONSOLE_MSG_HEADER) +
+                                                   sizeof(CONSOLE_READCONSOLEOUTPUT_MSG));
+    };
+    auto *ci = read({0, 0, 3, 0});
+    ASSERT(ci[0].Char.AsciiChar == 'a' && ci[0].Attributes == 0x07);
+    ASSERT(static_cast<BYTE>(ci[1].Char.AsciiChar) == 0xCF && ci[1].Attributes == (0x07 | COMMON_LVB_LEADING_BYTE));
+    ASSERT(static_cast<BYTE>(ci[2].Char.AsciiChar) == 0xB2 && ci[2].Attributes == (0x07 | COMMON_LVB_TRAILING_BYTE));
+    ci = read({0, 0, 1, 0});
+    ASSERT(ci[1].Char.AsciiChar == ' ' && ci[1].Attributes == 0x07);
+    ci = read({2, 0, 3, 0});
+    ASSERT(static_cast<BYTE>(ci[0].Char.AsciiChar) == 0x9C && ci[0].Attributes == (0x07 | COMMON_LVB_TRAILING_BYTE));
+    return true;
+}
+
+// ReadConsoleOutputCharacterW gives one char per glyph and zeros past what
+// it read, as conhost does; the rest of the buffer held whatever earlier
+// messages left there.
+bool test_regression_read_output_string_wide_glyph_and_zero_tail()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb{{4, 1}};
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    sb.set_u32({0, 0}, U'a', 0x07);
+    sb.set_u32({1, 0}, U'喜', 0x07);
+    sb.set_u32({3, 0}, U'b', 0x07);
+
+    msg.descriptor.InputSize = sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG);
+    msg.descriptor.OutputSize = sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG) + 4 * sizeof(wchar_t);
+    auto *read = reinterpret_cast<CONSOLE_READCONSOLEOUTPUTSTRING_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+    read->StringType = CONSOLE_REAL_UNICODE;
+    read->ReadCoord = {0, 0};
+    auto *out = reinterpret_cast<wchar_t *>(msg.body + sizeof(CONSOLE_MSG_HEADER) +
+                                            sizeof(CONSOLE_READCONSOLEOUTPUTSTRING_MSG));
+    std::fill(out, out + 4, L'\xEEEE');
+    ASSERT(api_read_output_string(msg, st, sb, inp, bridge));
+    ASSERT(read->NumRecords == 3);
+    ASSERT(std::wstring_view(out, 4) == std::wstring_view(L"a喜" L"b\0", 4));
+    return true;
+}
+
+// WriteConsoleOutputA converts a DBCS lead byte together with the next
+// cell's byte into one wide glyph, as conhost does; each byte was converted
+// alone into a junk char.
+bool test_regression_write_console_output_a_dbcs_pair()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb{{4, 1}};
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    st.output_code_page = 936;
+
+    msg.descriptor.InputSize =
+        sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_WRITECONSOLEOUTPUT_MSG) + 3 * sizeof(CHAR_INFO);
+    auto *write = reinterpret_cast<CONSOLE_WRITECONSOLEOUTPUT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+    write->Unicode = FALSE;
+    write->CharRegion = {0, 0, 2, 0};
+    auto *cells =
+        reinterpret_cast<CHAR_INFO *>(msg.body + sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_WRITECONSOLEOUTPUT_MSG));
+    cells[0].Char.AsciiChar = static_cast<CHAR>(0xCF);
+    cells[0].Attributes = 0x07;
+    cells[1].Char.AsciiChar = static_cast<CHAR>(0xB2);
+    cells[1].Attributes = 0x07;
+    cells[2].Char.AsciiChar = 'q';
+    cells[2].Attributes = 0x07;
+
+    ASSERT(api_write_console_output(msg, st, sb, inp, bridge));
+    ASSERT(sb.at_u32({0, 0}) == U'喜');
+    ASSERT(sb.glyph_width({0, 0}) == 2);
+    ASSERT(sb.at_u32({2, 0}) == U'q');
+    return true;
+}
+
+// WriteConsoleOutput sends a wide glyph to the terminal once, and repaints a
+// column either side of the rectangle (a wide glyph can reach past it).
+// Sending a char for each cell printed the glyph twice and pushed the rest
+// of the row right.
+bool test_regression_write_console_output_sends_wide_glyph_once()
+{
+    corehost::condrv_io::io_msg msg{};
+    console_state st;
+    screen_buffer sb;
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+
+    HANDLE read_end{};
+    HANDLE write_end{};
+    ASSERT(::CreatePipe(&read_end, &write_end, nullptr, 1 << 16));
+    bridge.set_vt_output(win32::handle_view(write_end));
+
+    msg.descriptor.InputSize =
+        sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_WRITECONSOLEOUTPUT_MSG) + 3 * sizeof(CHAR_INFO);
+    auto *write = reinterpret_cast<CONSOLE_WRITECONSOLEOUTPUT_MSG *>(msg.body + sizeof(CONSOLE_MSG_HEADER));
+    write->Unicode = TRUE;
+    write->CharRegion = {0, 0, 2, 0};
+    auto *cells =
+        reinterpret_cast<CHAR_INFO *>(msg.body + sizeof(CONSOLE_MSG_HEADER) + sizeof(CONSOLE_WRITECONSOLEOUTPUT_MSG));
+    cells[0].Char.UnicodeChar = L'喜';
+    cells[0].Attributes = 0x07 | COMMON_LVB_LEADING_BYTE;
+    cells[1].Char.UnicodeChar = L'喜';
+    cells[1].Attributes = 0x07 | COMMON_LVB_TRAILING_BYTE;
+    cells[2].Char.UnicodeChar = L'x';
+    cells[2].Attributes = 0x07;
+    ASSERT(api_write_console_output(msg, st, sb, inp, bridge));
+
+    char out[256]{};
+    DWORD n = 0;
+    const bool read = ::ReadFile(read_end, out, sizeof(out), &n, nullptr) != FALSE;
+    ::CloseHandle(read_end);
+    ::CloseHandle(write_end);
+    ASSERT(read);
+    ASSERT(std::string_view(out, n) == "\x1b"
+                                       "7\x1b[1;1H\x1b[0m\xe5\x96\x9c"
+                                       "x \x1b"
+                                       "8");
+    return true;
+}
+
 bool test_regression_read_console_output_output_size_and_clipping()
 {
     corehost::condrv_io::io_msg msg{};
@@ -3261,6 +3404,12 @@ int main()
     RUN_TEST(test_regression_write_output_string_linear_and_ansi_count, L"WriteOutputString linear and ANSI count");
     RUN_TEST(test_regression_read_console_output_output_size_and_clipping,
              L"ReadConsoleOutput output size and clipping");
+    RUN_TEST(test_regression_read_console_output_a_wide_glyph, L"ReadConsoleOutputA gives a wide glyph's DBCS bytes");
+    RUN_TEST(test_regression_read_output_string_wide_glyph_and_zero_tail,
+             L"ReadConsoleOutputCharacterW: one char per glyph, zeros after");
+    RUN_TEST(test_regression_write_console_output_a_dbcs_pair, L"WriteConsoleOutputA converts a DBCS pair");
+    RUN_TEST(test_regression_write_console_output_sends_wide_glyph_once,
+             L"WriteConsoleOutput sends a wide glyph once");
     RUN_TEST(test_regression_get_title_output_size_limits_copy, L"GetTitle output size limits copy");
     RUN_TEST(test_regression_set_title_a_uses_input_codepage, L"SetTitleA uses input codepage");
     RUN_TEST(test_regression_l3_mouse_info_rejects_short_message, L"L3 MouseInfo rejects short message");
