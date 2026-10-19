@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <utility>
 #include <vector>
 #include "connect_completion.hpp"
 #include "win32/handle.hpp"
@@ -60,6 +61,12 @@ struct io_state
     {
         ULONG_PTR id;
         object_kind kind;
+        // The ConDrv client handle whose value is the id. Only the value is
+        // used, as an id no other open object has; CLOSE_OBJECT closes it.
+        // Handing it to the completion without keeping it leaked one handle
+        // per CONOUT$/CONIN$ a client ever opened (a TUI that opens CONOUT$
+        // for every size query piled up 100k handles in a day).
+        win32::handle handle;
     };
     std::vector<open_object> open_objects;
 
@@ -229,9 +236,9 @@ struct io_state
             else if ((req->DesiredAccess & (GENERIC_READ | GENERIC_WRITE)) == GENERIC_WRITE)
                 type = CD_IO_OBJECT_TYPE_CURRENT_OUTPUT;
         }
-        // nh 在成功时 release 给 completion；release 后本进程不再关闭该句柄。
-        // input_id/output_id 保存 release 前的句柄值，用于 CLOSE_OBJECT 识别
-        // 客户端关闭的是哪个逻辑对象。
+        // nh 的值作为对象 id 交给 completion；句柄本身留在 open_objects，
+        // CLOSE_OBJECT 时关闭。input_id/output_id 保存同一个值，用于
+        // CLOSE_OBJECT 识别客户端关闭的是哪个逻辑对象。
         win32::handle nh;
         switch (type)
         {
@@ -258,10 +265,12 @@ struct io_state
             return true;
         }
         const auto id = reinterpret_cast<ULONG_PTR>(nh.get());
-        open_objects.push_back({id, type == CD_IO_OBJECT_TYPE_CURRENT_INPUT    ? object_kind::input
-                                    : type == CD_IO_OBJECT_TYPE_CURRENT_OUTPUT ? object_kind::output
-                                                                               : object_kind::alternate_output});
-        corehost::condrv_io::prepare_completion(msg, 0, reinterpret_cast<ULONG_PTR>(nh.release()));
+        open_objects.push_back({id,
+                                type == CD_IO_OBJECT_TYPE_CURRENT_INPUT    ? object_kind::input
+                                : type == CD_IO_OBJECT_TYPE_CURRENT_OUTPUT ? object_kind::output
+                                                                           : object_kind::alternate_output,
+                                std::move(nh)});
+        corehost::condrv_io::prepare_completion(msg, 0, id);
         return true;
     }
 
