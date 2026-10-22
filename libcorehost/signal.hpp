@@ -31,8 +31,9 @@ enum class PtySignal
 {
     // WT 通知可见性变化。corehost 当前不维护窗口可见状态，所以只消费消息。
     ShowHideWindow = 1,
-    // WT 请求清空回滚/可见缓冲区。轮询路径把本地 screen_buffer 清空，并把
-    // cursor 移回 viewport 左上角。
+    // The terminal cleared its screen (Windows Terminal's "Clear buffer").
+    // The reader records it; pipe_bridge clears the model, keeping the
+    // cursor's row if asked, and draws it again (see take_clear).
     ClearBuffer = 2,
     // WT 设置父窗口。corehost 不创建真实窗口，当前只消费消息以保持管道同步。
     SetParent = 3,
@@ -42,16 +43,15 @@ enum class PtySignal
 };
 
 struct console_state;
-struct screen_buffer;
 
 // 非阻塞轮询 WT 信号管道，处理 PtySignal 消息。消息格式为 2 字节信号 id +
 // 定长 payload。poll() 在局部缓冲上一次读尽并解析，无跨 poll 状态。
 class pty_signal_reader
 {
   public:
-    // state/sbuf 引用必须覆盖本对象生命周期；conpty 会话持有它们，本对象
+    // state 引用必须覆盖本对象生命周期；conpty 会话持有它，本对象
     // 只允许在会话主线程中调用 poll()。
-    pty_signal_reader(console_state &state, screen_buffer &sbuf) noexcept : _state(state), _sbuf(sbuf)
+    explicit pty_signal_reader(console_state &state) noexcept : _state(state)
     {
     }
 
@@ -83,6 +83,14 @@ class pty_signal_reader
         return std::exchange(_resize, std::nullopt);
     }
 
+    // A ClearBuffer seen by poll() since the last call, if any, and whether
+    // it asked to keep the cursor's row. Like a resize, clearing needs the
+    // bridge (VT output, the terminal cursor), so the reader only records it.
+    [[nodiscard]] std::optional<bool> take_clear() noexcept
+    {
+        return std::exchange(_clear, std::nullopt);
+    }
+
   private:
     // 由消息 id 返回 payload 长度；0 表示未知 id（协议损坏，退出程序）。
     static size_t payload_size_for(unsigned short id) noexcept;
@@ -92,8 +100,8 @@ class pty_signal_reader
 
     win32::handle_view _pipe;
     console_state &_state;
-    screen_buffer &_sbuf;
     std::optional<COORD> _resize;
+    std::optional<bool> _clear;
 };
 
 } // namespace corehost::conpty

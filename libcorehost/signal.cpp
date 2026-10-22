@@ -7,7 +7,6 @@
 // 退出程序。
 #include "signal.hpp"
 #include "console_state.hpp"
-#include "screen_buffer.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -110,13 +109,14 @@ void pty_signal_reader::handle_message(unsigned short id, std::span<const std::b
         break;
     }
     case PtySignal::ClearBuffer: {
-        // keepCursorRow 是 WT 是否保留光标所在行的提示。当前清空整个屏幕
-        // 模型；真实终端清屏由主输出路径发 VT。payload 必须消费以保持
+        // keepCursorRow: keep the cursor's row (the prompt). pipe_bridge does
+        // the clearing (see apply_terminal_clear); it used to clear the whole
+        // model here and tell the terminal nothing. payload 必须消费以保持
         // 消息边界，否则下一条消息的 id 会错位。
         unsigned short keep_cursor_row = 0;
         std::memcpy(&keep_cursor_row, payload.data(), sizeof(keep_cursor_row));
         LOG2("PtySignal ClearBuffer keepCursorRow=%u", static_cast<unsigned>(keep_cursor_row));
-        _sbuf.clear(_state.default_attributes);
+        _clear = keep_cursor_row != 0;
         break;
     }
     case PtySignal::SetParent: {

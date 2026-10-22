@@ -211,6 +211,58 @@ bool test_state_sync_initial_cursor()
     return true;
 }
 
+// ── PtySignal ClearBuffer ──
+// keepCursorRow (Windows Terminal's "Clear buffer", mite's Clear Screen): the
+// terminal already moved the cursor's row to its top. The model's row and
+// cursor (and the bridge's terminal cursor) must follow, the rest goes.
+bool test_clear_keeps_cursor_row()
+{
+    console_state st;
+    st.screen_buffer_size = {20, 5};
+    screen_buffer sb{COORD{20, 5}};
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    const std::u32string above = U"output";
+    const std::u32string prompt = U"C:\\>dir";
+    const std::u32string below = U"list";
+    sb.write_char32({0, 1}, above.data(), above.size());
+    sb.write_char32({0, 3}, prompt.data(), prompt.size());
+    sb.write_char32({0, 4}, below.data(), below.size());
+    st.cursor.position = {7, 3};
+    bridge.test_set_term_cursor_valid({7, 3});
+
+    bridge.test_apply_terminal_clear(true);
+    ASSERT(st.cursor.position.X == 7);
+    ASSERT(st.cursor.position.Y == 0);
+    ASSERT(bridge.test_get_term_cursor().X == 7);
+    ASSERT(bridge.test_get_term_cursor().Y == 0);
+    ASSERT(sb.at_u32({0, 0}) == U'C');
+    ASSERT(sb.at_u32({6, 0}) == U'r');
+    for (SHORT y = 1; y < 5; ++y)
+        ASSERT(!sb.row_has_text(y));
+    return true;
+}
+
+bool test_clear_without_keeping_row()
+{
+    console_state st;
+    st.screen_buffer_size = {20, 5};
+    screen_buffer sb{COORD{20, 5}};
+    input_buffer inp;
+    pipe_bridge_testable bridge{inp, st, sb};
+    const std::u32string prompt = U"C:\\>dir";
+    sb.write_char32({0, 3}, prompt.data(), prompt.size());
+    st.cursor.position = {7, 3};
+    bridge.test_set_term_cursor_valid({7, 3});
+
+    bridge.test_apply_terminal_clear(false);
+    ASSERT(st.cursor.position.X == 0);
+    ASSERT(st.cursor.position.Y == 0);
+    for (SHORT y = 0; y < 5; ++y)
+        ASSERT(!sb.row_has_text(y));
+    return true;
+}
+
 // ── Full pipeline: echo → state sync → WriteConsole ──
 //  This simulates the real bug scenario:
 //   1. cmd outputs "C:\\Users\\xyx>" → state.cursor = (13,3)
@@ -2083,6 +2135,10 @@ int main()
     RUN_TEST(test_state_sync_after_echo, L"State synced after echo\\r\\n");
     RUN_TEST(test_state_sync_multiline, L"Multiline state sync");
     RUN_TEST(test_state_sync_initial_cursor, L"Initial term cursor invalid");
+
+    std::wcout << L"\nClear Buffer:\n";
+    RUN_TEST(test_clear_keeps_cursor_row, L"keepCursorRow moves the row to the top");
+    RUN_TEST(test_clear_without_keeping_row, L"Without it everything goes");
 
     std::wcout << L"\nRegression Scenario:\n";
     RUN_TEST(test_regression_echo_then_output, L"Echo->sync->WriteConsole");

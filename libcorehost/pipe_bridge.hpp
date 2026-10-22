@@ -310,7 +310,7 @@ struct pipe_bridge
     pipe_bridge_io _io;
     // 非阻塞轮询 WT 信号管道的 PtySignal 消息；会话主循环在 idle/pending
     // 等待路径中推进它。无信号管道时 has_pipe() 为 false。
-    pty_signal_reader _signal{cstate, sbuf};
+    pty_signal_reader _signal{cstate};
     // Cancels the blocking vt_in read of the pending wait when a PtySignal
     // arrives (see wait_for_pending_vt_input).
     signal_read_canceller _signal_canceller;
@@ -512,6 +512,8 @@ struct pipe_bridge
         const bool closed = _signal.poll();
         if (const auto size = _signal.take_resize())
             apply_terminal_resize(*size);
+        if (const auto keep_cursor_row = _signal.take_clear())
+            apply_terminal_clear(*keep_cursor_row);
         return closed;
     }
 
@@ -2717,6 +2719,54 @@ struct pipe_bridge
         want_cursor_sync();
         send_wanted_cursor_sync();
         vt_flush();
+    }
+
+    // PtySignal ClearBuffer: Windows Terminal's "Clear buffer", mite's Clear
+    // Screen. The terminal has cleared its own screen already; since
+    // microsoft/terminal#18732 it keeps the cursor's row (the shell's prompt
+    // and what's typed), moved to the top. Do the same to the model, as
+    // conhost does: with keep_cursor_row that row moves to the top and
+    // stays, everything else goes, and the cursor goes with it. Nothing is
+    // sent: the terminal has the row (text that went through as raw VT,
+    // like PSReadLine's, isn't in the model to send). Apps that keep track
+    // of the cursor themselves (PSReadLine) see it moved and work out where
+    // their line is; cooked input (cmd) is on the cursor's row and moves
+    // with it. This used to clear the whole model and leave the cursor down
+    // where it was, so the next input was drawn out of place.
+    void apply_terminal_clear(bool keep_cursor_row) noexcept
+    {
+        auto &screen = active_screen_buffer();
+        const auto view = screen.viewport.rect();
+        const auto attr = cstate.default_attributes;
+        LOG2("[bridge] terminal clear: keepCursorRow=%d cursor=(%d,%d)", keep_cursor_row ? 1 : 0,
+             cstate.cursor.position.X, cstate.cursor.position.Y);
+        if (keep_cursor_row)
+        {
+            screen.shift_rows(static_cast<SHORT>(view.Top - cstate.cursor.position.Y), attr);
+            cstate.cursor.position.Y = view.Top;
+            // Everything but that row: rows above the window too (they are
+            // the console's scrollback when the buffer is taller).
+            const auto cols = static_cast<ULONG>(screen.size.X);
+            if (view.Top > 0)
+            {
+                screen.fill_char(U' ', COORD{0, 0}, cols * static_cast<ULONG>(view.Top));
+                screen.fill_attr(attr, COORD{0, 0}, cols * static_cast<ULONG>(view.Top));
+            }
+            const auto below = static_cast<SHORT>(view.Top + 1);
+            if (below < screen.size.Y)
+            {
+                screen.fill_char(U' ', COORD{0, below}, cols * static_cast<ULONG>(screen.size.Y - below));
+                screen.fill_attr(attr, COORD{0, below}, cols * static_cast<ULONG>(screen.size.Y - below));
+            }
+        }
+        else
+        {
+            screen.clear(attr);
+            cstate.cursor.position = {view.Left, view.Top};
+        }
+        _terminal.reset_enter_newline();
+        if (_terminal.cursor_valid())
+            term_cursor_set(screen.viewport.relative_position(cstate.cursor.position));
     }
 
     // While resize syncs are outstanding, take the terminal's replies

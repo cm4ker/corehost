@@ -26,6 +26,11 @@ class pipe_bridge_testable : public pipe_bridge
         _terminal.set_cursor(pos);
     }
 
+    void test_apply_terminal_clear(bool keep_cursor_row)
+    {
+        apply_terminal_clear(keep_cursor_row);
+    }
+
     SHORT test_get_input_column_start() const noexcept
     {
         return _terminal.input_column_start();
