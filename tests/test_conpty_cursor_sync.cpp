@@ -1850,12 +1850,12 @@ bool test_vt_cpr_reply_not_f3()
 //   api_write_console 输出文本前 consume_enter_newline() 检测标志 →
 //   先发 CUP 到 _term_cursor（下一行行首）再写文本。
 //
-// Enter typed as \r is echoed, and the flag set, only while a line read
-// (ReadConsole or ReadFile) with ENABLE_ECHO_INPUT is pending, as in
-// conhost. Apps that read key events (PSReadLine, ssh.exe, TUIs) echo it
-// themselves: a local CRLF scrolled the terminal under a prompt on the
-// bottom row, and their redraw then landed a row off. The tests below press
-// Enter during such a read.
+// Enter, typed as \r or sent as a Win32Input key, is echoed and the flag
+// set only while a line read (ReadConsole or ReadFile) with
+// ENABLE_ECHO_INPUT is pending, as in conhost. Apps that read key events
+// (PSReadLine, ssh.exe, TUIs) echo it themselves: a local CRLF scrolled the
+// terminal under a prompt on the bottom row, and their redraw then landed
+// a row off. The tests below press Enter during such a read.
 // ══════════════════════════════════════════════════════════════════
 
 // ── 1. \r ending a ReadFile line read sets the flag ──
@@ -1958,9 +1958,9 @@ bool test_enter_newline_no_flag_when_no_cr()
     return true;
 }
 
-// ── 4. Win32Input Enter 在非 ConsoleRead 模式下设置换行标志 ──
-// 终端通过 Win32Input 格式发送 Enter 时不会产生 \r 字节 → 不能走
-// 下方 b=='\r' 检测 → 必须在 win32_input_key 分支中独立设置标志。
+// ── 4. Win32Input Enter ending a ReadFile line read sets the flag ──
+// Enter sent in Win32Input form has no \r byte, so the win32_input_key
+// branch echoes it on its own, by the same rule as a \r.
 bool test_enter_newline_flag_set_on_win32_enter()
 {
     pipe_bridge_test_context ctx;
@@ -1972,6 +1972,7 @@ bool test_enter_newline_flag_set_on_win32_enter()
     bridge.test_feed_echo_bytes((const BYTE *)"echo hello", 10);
 
     // Win32Input Enter keydown: VK_RETURN, Sc=28, Uc='\r', Kd=1
+    bridge.test_enter_raw_read_mode();
     auto enter_down = make_win32_seq(VK_RETURN, 28, L'\r', true, 32);
     bridge.test_feed_raw_bytes(enter_down.data(), static_cast<DWORD>(enter_down.size()));
 
@@ -1982,6 +1983,31 @@ bool test_enter_newline_flag_set_on_win32_enter()
     // consume 后标志清除
     ASSERT(bridge.consume_enter_newline() == true);
     ASSERT(bridge.test_get_enter_newline_flag() == false);
+    return true;
+}
+
+// ── 4b. Win32Input Enter to a key-event reader, or with echo off ──
+// Nothing is echoed and no flag set. A key-event reader (no line read
+// pending) gets the key in the input buffer.
+bool test_enter_no_echo_win32_without_echoing_line_read()
+{
+    for (const bool read_without_echo : {false, true})
+    {
+        pipe_bridge_test_context ctx;
+        auto &bridge = ctx.bridge;
+        bridge.test_set_term_cursor_valid({17, 5});
+        bridge.sync_cursor_after_write({17, 5});
+        bridge.test_feed_echo_bytes((const BYTE *)"echo hello", 10);
+        if (read_without_echo)
+            bridge.test_enter_raw_read_mode(false);
+        auto enter_down = make_win32_seq(VK_RETURN, 28, L'\r', true, 32);
+        bridge.test_feed_raw_bytes(enter_down.data(), static_cast<DWORD>(enter_down.size()));
+        ASSERT(bridge.test_get_enter_newline_flag() == false);
+        ASSERT(bridge.test_get_term_cursor().X == 27);
+        ASSERT(bridge.test_get_term_cursor().Y == 5);
+        if (!read_without_echo)
+            ASSERT(ctx.input.available() == 1);
+    }
     return true;
 }
 
@@ -2347,6 +2373,8 @@ int main()
     RUN_TEST(test_enter_newline_consume_flag, L"Consume clears flag");
     RUN_TEST(test_enter_newline_no_flag_when_no_cr, L"No flag without CR");
     RUN_TEST(test_enter_newline_flag_set_on_win32_enter, L"Flag set on Win32 Enter");
+    RUN_TEST(test_enter_no_echo_win32_without_echoing_line_read,
+             L"No echo for Win32 Enter to key-event readers or with echo off");
     RUN_TEST(test_enter_newline_full_scenario, L"Full scenario CR→consume→text");
     RUN_TEST(test_enter_newline_set_in_console_read, L"Flag set in ConsoleRead");
 

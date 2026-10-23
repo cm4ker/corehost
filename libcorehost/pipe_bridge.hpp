@@ -2495,17 +2495,28 @@ struct pipe_bridge
             return false;
         }
 
-        // Win32Input Enter 非 ConsoleRead: 设置换行标志 + 写终端 \r\n。
+        // Win32Input Enter outside a ConsoleRead (which edits its line above).
+        // As for Enter typed as \r (_finish_line_terminator) and in conhost,
+        // only a ReadFile line read with ENABLE_ECHO_INPUT gets the local
+        // echo (CRLF, the newline flag). Apps that take key events
+        // (PSReadLine, ssh.exe, TUIs) echo it themselves; a local CRLF
+        // scrolled the terminal under a prompt on the bottom row and their
+        // redraw landed a row off.
         if (m.payload.win32_key.key_down && m.payload.win32_key.vk == VK_RETURN)
         {
             const auto old_cursor = _terminal.cursor();
             LOG3("[bridge] ENTER_Win32Input was_tc=(%d,%d)", old_cursor.X, old_cursor.Y);
             _line_found = true;
-            _terminal.crlf();
-            _terminal.mark_enter_newline_at_cursor();
-            vt_append_str("\r\n"sv);
-            const auto cursor = _terminal.cursor();
-            LOG3("[bridge] ENTER_Win32Input done tc=(%d,%d)", cursor.X, cursor.Y);
+            if (pending_kind == PendingKind::RawRead && (cstate.input_mode & ENABLE_ECHO_INPUT) != 0)
+            {
+                _terminal.crlf();
+                _terminal.mark_enter_newline_at_cursor();
+                vt_append_str("\r\n"sv);
+                const auto cursor = _terminal.cursor();
+                LOG3("[bridge] ENTER_Win32Input done tc=(%d,%d)", cursor.X, cursor.Y);
+            }
+            else
+                LOG3("[bridge] ENTER_Win32Input key-event reader or echo off: no local echo");
         }
         else if (pending_kind != PendingKind::RawRead && m.payload.win32_key.key_down)
         {
