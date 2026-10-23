@@ -77,6 +77,12 @@ struct cursor_state
 
     // 0-based 控制台坐标；必须保持在当前 screen_buffer_size 范围内。
     COORD position{0, 0};
+
+    // A write filled its row up to the last column with nothing after it:
+    // the cursor stays on that column and the next character goes to the
+    // start of the next row, as a terminal's delayed wrap (DECAWM) does.
+    // Anything that moves the cursor ends it.
+    bool pending_wrap = false;
 };
 
 class tab_stop_table

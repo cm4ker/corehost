@@ -2670,6 +2670,7 @@ struct pipe_bridge
         // No early return for an unchanged size: take_resize keeps only the
         // newest of several signals, and the terminal went through (and
         // reflowed for) the ones in between, so the cursor sync still runs.
+        cstate.cursor.pending_wrap = false;
 
         SHORT used = static_cast<SHORT>(cstate.cursor.position.Y + 1);
         for (SHORT y = static_cast<SHORT>(screen.size.Y - 1); y >= used; --y)
@@ -2740,6 +2741,7 @@ struct pipe_bridge
         const auto attr = cstate.default_attributes;
         LOG2("[bridge] terminal clear: keepCursorRow=%d cursor=(%d,%d)", keep_cursor_row ? 1 : 0,
              cstate.cursor.position.X, cstate.cursor.position.Y);
+        cstate.cursor.pending_wrap = false;
         if (keep_cursor_row)
         {
             screen.shift_rows(static_cast<SHORT>(view.Top - cstate.cursor.position.Y), attr);

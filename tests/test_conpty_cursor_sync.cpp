@@ -11,6 +11,7 @@
 #include "api_handlers.hpp"
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -240,6 +241,73 @@ bool test_clear_keeps_cursor_row()
     ASSERT(sb.at_u32({6, 0}) == U'r');
     for (SHORT y = 1; y < 5; ++y)
         ASSERT(!sb.row_has_text(y));
+    return true;
+}
+
+// ── Delayed wrap after a full row ──
+// A write that fills a row to its last column holds the cursor there; the
+// next character goes to the next row, as on the terminal. msys less ends
+// such a row with ESC[m and then " \b": the space wraps, the backspace
+// steps back over it. The model used to put the space on the last column
+// (overwriting it) and drop the backspace, ending a column and a row away
+// from the terminal.
+static void write_w(pipe_bridge_test_context &c, std::wstring_view text)
+{
+    write_console_payload(true, reinterpret_cast<const BYTE *>(text.data()),
+                          static_cast<ULONG>(text.size() * sizeof(wchar_t)), c.state, c.screen, c.bridge, false);
+}
+
+static pipe_bridge_test_context *wrap_context()
+{
+    auto *c = new pipe_bridge_test_context();
+    c->state.screen_buffer_size = {10, 4};
+    c->screen.resize({10, 4});
+    c->screen.viewport.reset_to_buffer({10, 4});
+    c->state.cursor.position = {0, 0};
+    c->bridge.test_set_term_cursor_valid({0, 0});
+    return c;
+}
+
+bool test_wrap_after_full_row_space_backspace()
+{
+    std::unique_ptr<pipe_bridge_test_context> c{wrap_context()};
+    write_w(*c, L"abcdefghij");
+    ASSERT(c->state.cursor.position.X == 9);
+    ASSERT(c->state.cursor.position.Y == 0);
+    write_w(*c, L"\x1b[m");
+    write_w(*c, L" \bxyz");
+    ASSERT(c->screen.at_u32({9, 0}) == U'j');
+    ASSERT(c->screen.at_u32({0, 1}) == U'x');
+    ASSERT(c->screen.at_u32({2, 1}) == U'z');
+    ASSERT(c->state.cursor.position.X == 3);
+    ASSERT(c->state.cursor.position.Y == 1);
+    return true;
+}
+
+bool test_full_row_then_newline_moves_one_row()
+{
+    std::unique_ptr<pipe_bridge_test_context> c{wrap_context()};
+    write_w(*c, L"abcdefghij");
+    write_w(*c, L"\r\nk");
+    ASSERT(c->screen.at_u32({0, 1}) == U'k');
+    ASSERT(c->state.cursor.position.X == 1);
+    ASSERT(c->state.cursor.position.Y == 1);
+    return true;
+}
+
+bool test_cursor_move_ends_pending_wrap()
+{
+    std::unique_ptr<pipe_bridge_test_context> c{wrap_context()};
+    write_w(*c, L"abcdefghij");
+    // CUP to the last column of the same row: the next write lands there.
+    write_w(*c, L"\x1b[1;10HZ");
+    ASSERT(c->screen.at_u32({9, 0}) == U'Z');
+    ASSERT(!c->screen.row_has_text(1));
+    // A backspace from the held cursor goes to the column before the last.
+    write_w(*c, L"0123456789");
+    write_w(*c, L"\bQ");
+    ASSERT(c->screen.at_u32({8, 1}) == U'Q');
+    ASSERT(c->screen.at_u32({9, 1}) == U'9');
     return true;
 }
 
@@ -2139,6 +2207,9 @@ int main()
     std::wcout << L"\nClear Buffer:\n";
     RUN_TEST(test_clear_keeps_cursor_row, L"keepCursorRow moves the row to the top");
     RUN_TEST(test_clear_without_keeping_row, L"Without it everything goes");
+    RUN_TEST(test_wrap_after_full_row_space_backspace, L"A full row, then \" \\b\": the wrap and the step back");
+    RUN_TEST(test_full_row_then_newline_moves_one_row, L"A full row, then CRLF: one row down");
+    RUN_TEST(test_cursor_move_ends_pending_wrap, L"CUP and BS end a pending wrap");
 
     std::wcout << L"\nRegression Scenario:\n";
     RUN_TEST(test_regression_echo_then_output, L"Echo->sync->WriteConsole");

@@ -454,6 +454,10 @@ inline void apply_terminal_text_cursor_only(std::u32string_view text, console_st
     const auto view = sb.viewport.rect();
     state.cursor.position.X = std::clamp<SHORT>(state.cursor.position.X, view.Left, view.Right);
     state.cursor.position.Y = std::clamp<SHORT>(state.cursor.position.Y, view.Top, view.Bottom);
+    // The last write filled the row: this text starts the next one, where
+    // the terminal puts it (see cursor_state::pending_wrap).
+    if (!text.empty() && std::exchange(state.cursor.pending_wrap, false) && state.cursor.position.X == view.Right)
+        apply_terminal_line_feed_cursor_only(state, sb);
 
     auto remaining = text;
     while (!remaining.empty())
@@ -484,10 +488,13 @@ inline void apply_terminal_text_cursor_only(std::u32string_view text, console_st
         if (!remaining.empty())
             apply_terminal_line_feed_cursor_only(state, sb);
         else if (state.cursor.position.X > view.Right)
+        {
             // Deferred EOL wrap (DECAWM): the run filled the last column but
             // there is nothing more to write — hold the cursor at the last
             // column instead of advancing. See apply_terminal_text.
             state.cursor.position.X = view.Right;
+            state.cursor.pending_wrap = true;
+        }
     }
 }
 
@@ -498,6 +505,14 @@ inline void apply_terminal_text(std::u32string_view text, console_state &state, 
     const auto view = sb.viewport.rect();
     state.cursor.position.X = std::clamp<SHORT>(state.cursor.position.X, view.Left, view.Right);
     state.cursor.position.Y = std::clamp<SHORT>(state.cursor.position.Y, view.Top, view.Bottom);
+    // The last write filled the row and held the cursor on its last column:
+    // this text goes to the next row, as on the terminal. It used to start
+    // on that last column, overwriting its character in the model while the
+    // terminal wrapped (msys less ends a full row with " \b" to force the
+    // wrap; the model fell a column or a row behind the terminal, and
+    // PSReadLine then drew the prompt's input in the wrong place).
+    if (!text.empty() && std::exchange(state.cursor.pending_wrap, false) && state.cursor.position.X == view.Right)
+        apply_terminal_line_feed(state, sb);
 
     auto remaining = text;
     while (!remaining.empty())
@@ -518,6 +533,7 @@ inline void apply_terminal_text(std::u32string_view text, console_state &state, 
                 // two-line oh-my-posh prompt: the input line, and thus the
                 // typed-char echo, landed one row below where it should).
                 state.cursor.position.X = view.Right;
+                state.cursor.pending_wrap = true;
                 break;
             }
             apply_terminal_line_feed(state, sb);
@@ -700,6 +716,52 @@ inline void apply_terminal_scrolling_region(const vt_message &msg, console_state
 
 // 把输出方向 VT message 应用到本地 Console 状态。id 由调用者静态传入，使
 // reset/dispatch 路径不需要再动态判断消息类型。
+// Messages after which a pending wrap is gone, as on a terminal: whatever
+// moves the cursor or edits the screen around it. Colors, titles, links and
+// modes keep it (less ends a full row with ESC[m before its " \b").
+constexpr bool ends_pending_wrap(vt_message_id id) noexcept
+{
+    switch (id)
+    {
+    case vt_message_id::carriage_return:
+    case vt_message_id::line_feed:
+    case vt_message_id::reverse_index:
+    case vt_message_id::cursor_up:
+    case vt_message_id::cursor_down:
+    case vt_message_id::cursor_forward:
+    case vt_message_id::cursor_backward:
+    case vt_message_id::cursor_next_line:
+    case vt_message_id::cursor_prev_line:
+    case vt_message_id::cursor_forward_tab:
+    case vt_message_id::cursor_backward_tab:
+    case vt_message_id::cursor_vert_absolute:
+    case vt_message_id::cursor_horiz_absolute:
+    case vt_message_id::cursor_position:
+    case vt_message_id::restore_cursor:
+    case vt_message_id::ansi_restore_cursor:
+    case vt_message_id::scroll_up:
+    case vt_message_id::scroll_down:
+    case vt_message_id::insert_characters:
+    case vt_message_id::delete_characters:
+    case vt_message_id::erase_characters:
+    case vt_message_id::insert_lines:
+    case vt_message_id::delete_lines:
+    case vt_message_id::erase_in_display:
+    case vt_message_id::erase_in_line:
+    case vt_message_id::set_scrolling_region:
+    case vt_message_id::use_alternate_buffer:
+    case vt_message_id::use_main_buffer:
+    case vt_message_id::set_columns_132:
+    case vt_message_id::set_columns_80:
+    case vt_message_id::resize_window:
+    case vt_message_id::soft_reset:
+    case vt_message_id::char_del:
+        return true;
+    default:
+        return false;
+    }
+}
+
 template <vt_message_id id>
 inline void vt_msg_apply_terminal_state(const vt_message &msg, console_state &state, screen_buffer &sb,
                                         bool sync_screen = true) noexcept
@@ -707,6 +769,8 @@ inline void vt_msg_apply_terminal_state(const vt_message &msg, console_state &st
     const auto view = sb.viewport.rect();
     const auto origin = sb.viewport.origin();
     const auto count = static_cast<SHORT>(std::max<int>(1, msg.payload.count.value));
+    if constexpr (ends_pending_wrap(id))
+        state.cursor.pending_wrap = false;
     // case 顺序与 vt_message_id 枚举声明顺序保持一致。
     switch (id)
     {
@@ -946,6 +1010,26 @@ inline void consume_write_console_vt_message(vt_parser &parser, const vt_parse_r
     {
         if (emit_vt && !parsed.raw_sequence.empty())
             bridge.vt_append_raw_sequence(parsed.raw_sequence);
+        parser.reset();
+        return;
+    }
+    else if constexpr (id == vt_message_id::char_del)
+    {
+        // A backspace (0x08) moves the cursor back a column, on the terminal
+        // and in the model, as conhost's processed output does; from a
+        // pending wrap that is the column before the last, as on xterm and
+        // ghostty. DEL (0x7f) does nothing. Both used to be dropped, so
+        // msys less's " \b" (forcing a full row to wrap) left the terminal
+        // a column ahead of the model.
+        const auto text = parsed.message.payload.text;
+        if (!text.empty() && text[0] == 0x08)
+        {
+            if (emit_vt)
+                bridge.vt_append_char('\b');
+            const auto view = sb.viewport.rect();
+            state.cursor.pending_wrap = false;
+            state.cursor.position.X = std::max<SHORT>(view.Left, static_cast<SHORT>(state.cursor.position.X - 1));
+        }
         parser.reset();
         return;
     }
@@ -2176,6 +2260,7 @@ inline bool api_set_cursor_pos(corehost::condrv_io::io_msg &msg, console_state &
         // 清屏序列常先 SetCursorPos(0,0)，这时 Enter 的一次性换行标志已过期。
         bridge.reset_enter_newline();
     state.cursor.position = new_pos;
+    state.cursor.pending_wrap = false;
     if (sb.viewport.snap_to_cursor(state.cursor.position, state.screen_buffer_size))
         render_visible_viewport(state, sb, bridge);
     bridge.vt_write_cup_buffer(new_pos);
