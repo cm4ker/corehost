@@ -29,6 +29,7 @@
 #include "vt_parser.hpp"
 #include "vt_msg_dispatch.hpp"
 #include "char_convert.hpp"
+#include "inline_image.hpp"
 #include "char_width.hpp"
 #include "perf_diag.hpp"
 #include "utility/log.hpp"
@@ -341,48 +342,6 @@ inline SMALL_RECT terminal_scroll_region(const console_state &state, screen_buff
 
 // 将 LF/CRLF 应用到本地 cursor 和 screen_buffer。光标在滚动区域底部时滚动
 // 区域内容，否则只向下移动；X 总是回到 viewport 左边界。
-// Rows an iTerm2 inline image (OSC 1337 File=...;inline=1;height=N:...)
-// occupies when its height is given in cells; 0 otherwise (a height in px,
-// %, or auto would need the image's pixel size and the cell size).
-inline int iterm2_inline_image_rows(std::u32string_view raw) noexcept
-{
-    constexpr std::u32string_view prefix = U"\x1b]1337;File=";
-    if (!raw.starts_with(prefix))
-        return 0;
-    auto args = raw.substr(prefix.size());
-    const auto colon = args.find(U':');
-    if (colon == std::u32string_view::npos)
-        return 0;
-    args = args.substr(0, colon);
-    bool is_inline = false;
-    int rows = 0;
-    while (!args.empty())
-    {
-        const auto semi = args.find(U';');
-        const auto kv = args.substr(0, semi);
-        args = semi == std::u32string_view::npos ? std::u32string_view{} : args.substr(semi + 1);
-        if (kv == U"inline=1")
-            is_inline = true;
-        else if (kv.starts_with(U"height="))
-        {
-            const auto v = kv.substr(7);
-            int n = 0;
-            bool ok = !v.empty();
-            for (const auto c : v)
-            {
-                if (c < U'0' || c > U'9' || n > 1000)
-                {
-                    ok = false;
-                    break;
-                }
-                n = n * 10 + static_cast<int>(c - U'0');
-            }
-            rows = ok ? n : 0;
-        }
-    }
-    return is_inline ? rows : 0;
-}
-
 // True for a passed-through sequence that draws an inline image: iTerm2
 // OSC 1337 File/FileEnd, kitty graphics (APC G) or sixel (DCS ... q).
 inline bool is_inline_image_sequence(std::u32string_view raw) noexcept
@@ -990,13 +949,19 @@ inline void consume_write_console_vt_message(vt_parser &parser, const vt_parse_r
         {
             if (emit_vt)
                 bridge.vt_append_raw_sequence(unknown_raw);
-            // Images move the terminal cursor. When the height is given in
-            // cells, move the model the way the terminal does (CR, then one
-            // LF per image row); either way stop trusting the terminal
-            // cursor until the next CUP (see mark_terminal_cursor_lost).
+            // Images move the terminal cursor. When the rows an image takes
+            // can be told (its height in cells, or its pixel size and the
+            // terminal's cell size, see inline_image.hpp), move the model the
+            // way the terminal does (CR, then one LF per image row); either
+            // way stop trusting the terminal cursor until the next CUP (see
+            // mark_terminal_cursor_lost).
             if (is_inline_image_sequence(unknown_raw))
             {
-                if (const int rows = iterm2_inline_image_rows(unknown_raw); rows > 0)
+                const auto view = sb.viewport.rect();
+                const auto cols = static_cast<uint32_t>(std::max(1, view.Right - view.Left + 1));
+                if (const int rows =
+                        iterm2_inline_image_rows(unknown_raw, bridge.cell_px_width(), bridge.cell_px_height(), cols);
+                    rows > 0)
                     for (int i = 0; i < rows; ++i)
                         apply_terminal_line_feed(state, sb);
                 bridge.mark_terminal_cursor_lost();
@@ -2735,8 +2700,8 @@ inline bool api_write_console_output(corehost::condrv_io::io_msg &msg, console_s
                     ci.Attributes |= COMMON_LVB_LEADING_BYTE;
                     auto &trail = unicode_data[++i];
                     trail.Char.UnicodeChar = wc;
-                    trail.Attributes = static_cast<WORD>((trail.Attributes & ~COMMON_LVB_SBCSDBCS) |
-                                                         COMMON_LVB_TRAILING_BYTE);
+                    trail.Attributes =
+                        static_cast<WORD>((trail.Attributes & ~COMMON_LVB_SBCSDBCS) | COMMON_LVB_TRAILING_BYTE);
                     continue;
                 }
                 ::MultiByteToWideChar(cp, MB_USEGLYPHCHARS, &ch, 1, &wc, 1);
@@ -2996,8 +2961,8 @@ inline bool api_read_console_output(corehost::condrv_io::io_msg &msg, console_st
                     continue;
                 }
                 char bytes[8]{};
-                const int n = ::WideCharToMultiByte(cp, 0, &src.Char.UnicodeChar, 1, bytes, sizeof(bytes), nullptr,
-                                                    nullptr);
+                const int n =
+                    ::WideCharToMultiByte(cp, 0, &src.Char.UnicodeChar, 1, bytes, sizeof(bytes), nullptr, nullptr);
                 if (!leading)
                 {
                     out.Char.AsciiChar = n == 1 ? bytes[0] : 0;

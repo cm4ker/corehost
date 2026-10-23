@@ -1665,11 +1665,32 @@ struct pipe_bridge
 
     // Ask the terminal where its cursor is and move the model there when the
     // reply comes back, the same way as after a resize. The caller flushes.
+    // The cell size is asked again too: a resize can come from a font change.
     void request_cursor_sync() noexcept
     {
         _resize_sync_cursor = active_screen_buffer().viewport.relative_position(cstate.cursor.position);
         ++_resize_sync_outstanding;
         vt_write_dsr_cpr();
+        request_cell_size();
+    }
+
+    // Ask the terminal for its cell size in pixels (XTWINOPS CSI 16 t), which
+    // places inline images (see inline_image.hpp). The reply, ESC [ 6 ; h ;
+    // w t, is taken out of the input (take_resize_sync_replies). A terminal
+    // that doesn't answer leaves it unknown. The caller flushes.
+    void request_cell_size() noexcept
+    {
+        ++_cell_size_outstanding;
+        vt_append_str("\x1b[16t"sv);
+    }
+
+    uint32_t cell_px_width() const noexcept
+    {
+        return _cell_px_w;
+    }
+    uint32_t cell_px_height() const noexcept
+    {
+        return _cell_px_h;
     }
 
     // request_cursor_sync, sent by send_wanted_cursor_sync once the raw
@@ -1728,6 +1749,10 @@ struct pipe_bridge
     // was sent. See apply_terminal_resize.
     int _resize_sync_outstanding = 0;
     COORD _resize_sync_cursor{0, 0};
+    // CSI 16 t queries not answered yet, and the last answer (0 = none).
+    int _cell_size_outstanding = 0;
+    uint32_t _cell_px_w = 0;
+    uint32_t _cell_px_h = 0;
     // See want_cursor_sync.
     bool _cursor_sync_wanted = false;
     bool _raw_output_mid_sequence = false;
@@ -2642,7 +2667,8 @@ struct pipe_bridge
             // Replies come back in request order; only the one for the
             // newest resize describes the terminal as it is now.
             if (--_resize_sync_outstanding == 0)
-                finish_resize_sync({static_cast<SHORT>(m.payload.cpr.col - 1), static_cast<SHORT>(m.payload.cpr.row - 1)});
+                finish_resize_sync(
+                    {static_cast<SHORT>(m.payload.cpr.col - 1), static_cast<SHORT>(m.payload.cpr.row - 1)});
             return true;
         }
         LOG2("[bridge] cpr_response: ignored pending=%d row=%d col=%d", _terminal.pending_inherit_cursor(),
@@ -2787,7 +2813,7 @@ struct pipe_bridge
     // process_input_cpr_response.
     DWORD take_resize_sync_replies(char8_t *data, DWORD len) noexcept
     {
-        if (_resize_sync_outstanding == 0)
+        if (_resize_sync_outstanding == 0 && _cell_size_outstanding == 0)
             return len;
         DWORD out = 0;
         for (DWORD i = 0; i < len;)
@@ -2803,9 +2829,47 @@ struct pipe_bridge
                     continue;
                 }
             }
+            if (_cell_size_outstanding > 0 && data[i] == u8'\x1b')
+            {
+                uint32_t w = 0;
+                uint32_t h = 0;
+                if (const DWORD n = match_cell_size_reply(data + i, len - i, w, h); n != 0)
+                {
+                    --_cell_size_outstanding;
+                    _cell_px_w = w;
+                    _cell_px_h = h;
+                    LOG2("[bridge] cell size: %ux%u px", w, h);
+                    i += n;
+                    continue;
+                }
+            }
             data[out++] = data[i++];
         }
         return out;
+    }
+
+    // Length of the cell size reply `ESC [ 6 ; h ; w t` at the start of data
+    // (0 if there isn't a whole one), and the size it gives.
+    static DWORD match_cell_size_reply(const char8_t *data, DWORD len, uint32_t &w, uint32_t &h) noexcept
+    {
+        if (len < 8 || data[0] != u8'\x1b' || data[1] != u8'[' || data[2] != u8'6' || data[3] != u8';')
+            return 0;
+        uint32_t values[2] = {0, 0};
+        DWORD i = 4;
+        for (int v = 0; v != 2; ++v)
+        {
+            const DWORD start = i;
+            while (i < len && data[i] >= u8'0' && data[i] <= u8'9' && i - start < 5)
+                values[v] = values[v] * 10 + (data[i++] - u8'0');
+            if (i == start || i == len || data[i] != (v == 0 ? u8';' : u8't'))
+                return 0;
+            ++i;
+        }
+        if (values[0] == 0 || values[1] == 0)
+            return 0;
+        h = values[0];
+        w = values[1];
+        return i;
     }
 
     // Length of the CPR reply `ESC [ row ; col R` at the start of data (0 if
@@ -3019,8 +3083,8 @@ struct pipe_bridge
     // arrows and F-keys (uChar 0) never reached it at all.
     [[nodiscard]] bool vt_input_passthrough(PendingKind pending_kind) const noexcept
     {
-        return (cstate.input_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0 &&
-               pending_kind != PendingKind::ConsoleRead && pending_kind != PendingKind::RawRead;
+        return (cstate.input_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0 && pending_kind != PendingKind::ConsoleRead &&
+               pending_kind != PendingKind::RawRead;
     }
 
     // ── process_input: 解码 → 解析 → echo → 分发 ──

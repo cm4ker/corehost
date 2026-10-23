@@ -30,6 +30,7 @@ target_sources(libcorehost
                 conversion_buffers.hpp
                 default_console_size.hpp
                 gbk_table.hpp
+                inline_image.hpp
                 input_buffer.hpp
                 io_loop.hpp
                 io_state.hpp

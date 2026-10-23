@@ -30,7 +30,7 @@ namespace corehost::conpty
 void copy_process_list(io_state &io, pipe_bridge &bridge) noexcept
 {
     bridge.set_process_list(std::span<const DWORD>{io.process_list.data(), io.process_count},
-                               std::span<const DWORD>{io.process_groups.data(), io.process_count});
+                            std::span<const DWORD>{io.process_groups.data(), io.process_count});
 }
 
 void run_conpty_session(win32::handle_view server, win32::handle_view event, win32::handle condrv_input,
@@ -147,6 +147,10 @@ void run_conpty_session(win32::handle_view server, win32::handle_view event, win
         bridge.vt_flush();
         LOG("corehost::conpty::run_conpty_session: inherit_cursor DSR CPR sent");
     }
+
+    // The terminal's cell size in pixels, for inline images.
+    bridge.request_cell_size();
+    bridge.vt_flush();
 
     // ── 初始 VT 握手：通知终端进入 Win32 Input Mode ──
     // 缺失 \x1b[?9001h → 终端不会发送键盘数据 → 打字不回显。

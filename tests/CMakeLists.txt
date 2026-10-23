@@ -76,6 +76,14 @@ target_link_libraries(test_console_state PRIVATE test_common unicode::unicode)
 add_test(NAME ConsoleState COMMAND test_console_state)
 set_tests_properties(ConsoleState PROPERTIES LABELS "state" TIMEOUT 30)
 
+# ── test_inline_image ─────────────────────────────
+add_executable(test_inline_image
+    test_inline_image.cpp
+)
+target_link_libraries(test_inline_image PRIVATE test_common)
+add_test(NAME InlineImage COMMAND test_inline_image)
+set_tests_properties(InlineImage PROPERTIES LABELS "image" TIMEOUT 30)
+
 # ── test_vt_msg_dispatch ──────────────────────────
 add_executable(test_vt_msg_dispatch
     test_vt_msg_dispatch.cpp
