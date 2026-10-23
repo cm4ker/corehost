@@ -259,8 +259,26 @@ bool test_set_sgr_from_win32_attr_wrong_command_red()
     set_sgr_from_win32_attr(m, FOREGROUND_RED | FOREGROUND_INTENSITY);
     ASSERT(m.payload.sgr.fg.is_indexed());
     ASSERT(m.payload.sgr.fg.value == 9); // bright red → SGR 91, not bright blue (94)
-    ASSERT(m.payload.sgr.bg.is_indexed());
-    ASSERT(m.payload.sgr.bg.value == 0);
+    // The black background was the console's default, not the app's.
+    ASSERT(m.payload.sgr.bg.is_default());
+    return true;
+}
+
+// Each half of a legacy attribute that is the console default (gray text,
+// black background) is the terminal's default color, as in conhost.
+bool test_set_sgr_from_win32_attr_default_halves()
+{
+    vt_message m{};
+    set_sgr_from_win32_attr(m, 0x07);
+    ASSERT(m.payload.sgr.fg.is_default() && m.payload.sgr.bg.is_default());
+    m = vt_message{};
+    set_sgr_from_win32_attr(m, 0x17); // gray on blue
+    ASSERT(m.payload.sgr.fg.is_default());
+    ASSERT(m.payload.sgr.bg.is_indexed() && m.payload.sgr.bg.value == 4);
+    m = vt_message{};
+    set_sgr_from_win32_attr(m, 0x70); // black on gray
+    ASSERT(m.payload.sgr.fg.is_indexed() && m.payload.sgr.fg.value == 0);
+    ASSERT(m.payload.sgr.bg.is_indexed() && m.payload.sgr.bg.value == 7);
     return true;
 }
 
@@ -931,6 +949,7 @@ int main()
     RUN_TEST(test_dispatch_sgr_reset, L"SGR reset");
     RUN_TEST(test_win32_attr_color_to_sgr_index_red_blue, L"Win32 attr BGR -> SGR RGB");
     RUN_TEST(test_set_sgr_from_win32_attr_wrong_command_red, L"wrong_command red attr -> SGR red");
+    RUN_TEST(test_set_sgr_from_win32_attr_default_halves, L"default halves of a legacy attr -> default colors");
     RUN_TEST(test_dispatch_text_single, L"Text single");
     RUN_TEST(test_dispatch_text_multi, L"Text multi");
     RUN_TEST(test_dispatch_text_wraps_to_next_line, L"Text wrap");

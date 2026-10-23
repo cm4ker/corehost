@@ -170,19 +170,22 @@ inline void set_sgr_from_win32_attr(vt_message &m, WORD attr) noexcept
 {
     // 调用者传入的是完整 Win32 属性 WORD。本函数只填充 vt_message 中和 SGR
     // 有关的字段，其他字段保持调用前状态。
-    if ((attr & 0xFF) == 0x07)
-    {
-        // 传统默认属性（白字黑底）映射为 SGR 默认色而不是显式 37/40，让
-        // 终端应用自己的主题色（可能是透明/图片背景），与 conhost 的
-        // ConPTY 行为一致。
+    // Each half that is the console's legacy default (gray text, black
+    // background) is the terminal's own default color, as in conhost, which
+    // maps the two separately: text an app colors red keeps the background
+    // it never chose. Only the whole 0x07 used to: red text came with an
+    // explicit black background, a dark band on a light or translucent
+    // terminal theme.
+    const WORD fg = attr & 0x0F;
+    const WORD bg = (attr >> 4) & 0x0F;
+    if (fg == 0x07)
         m.payload.sgr.fg.set_default();
-        m.payload.sgr.bg.set_default();
-    }
     else
-    {
-        m.payload.sgr.fg.set_index(win32_attr_color_to_sgr_index(attr & 0x0F));
-        m.payload.sgr.bg.set_index(win32_attr_color_to_sgr_index((attr >> 4) & 0x0F));
-    }
+        m.payload.sgr.fg.set_index(win32_attr_color_to_sgr_index(fg));
+    if (bg == 0x00)
+        m.payload.sgr.bg.set_default();
+    else
+        m.payload.sgr.bg.set_index(win32_attr_color_to_sgr_index(bg));
 
     auto fl = (attr >> 8) & 0xFF;
     if (fl & COMMON_LVB_UNDERSCORE)

@@ -758,10 +758,18 @@ struct pipe_bridge
             vt_append_str(";9"sv);
         const int fg_map[] = {30, 34, 32, 36, 31, 35, 33, 37, 90, 94, 92, 96, 91, 95, 93, 97};
         const int bg_map[] = {40, 44, 42, 46, 41, 45, 43, 47, 100, 104, 102, 106, 101, 105, 103, 107};
-        vt_append_char(';');
-        vt_append_int(fg_map[fg & 15]);
-        vt_append_char(';');
-        vt_append_int(bg_map[bg & 15]);
+        // The legacy default halves (gray text, black background) stay the
+        // terminal's defaults, as in set_sgr_from_win32_attr.
+        if (fg != 0x07)
+        {
+            vt_append_char(';');
+            vt_append_int(fg_map[fg & 15]);
+        }
+        if (bg != 0x00)
+        {
+            vt_append_char(';');
+            vt_append_int(bg_map[bg & 15]);
+        }
         vt_append_char('m');
     }
 
