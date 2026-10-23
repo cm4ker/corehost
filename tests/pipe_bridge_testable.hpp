@@ -8,6 +8,7 @@ class pipe_bridge_testable : public pipe_bridge
 {
   public:
     corehost::condrv_io::io_msg _test_console_read_msg{};
+    corehost::condrv_io::io_msg _test_raw_read_msg{};
 
     using pipe_bridge::pipe_bridge;
 
@@ -152,6 +153,19 @@ class pipe_bridge_testable : public pipe_bridge
         _line_found = false;
         _terminal.set_cursor({prompt_col, 0});
         _terminal.reset_bounds(prompt_col);
+    }
+
+    // A ReadFile line read of the console input pending, with
+    // ENABLE_ECHO_INPUT on or off.
+    void test_enter_raw_read_mode(bool echo = true)
+    {
+        _pending.begin_raw_read(_test_raw_read_msg, false);
+        _read_total = 0;
+        _line_found = false;
+        if (echo)
+            cstate.input_mode |= ENABLE_ECHO_INPUT;
+        else
+            cstate.input_mode &= ~ENABLE_ECHO_INPUT;
     }
 
     const corehost::condrv_io::io_msg &test_console_read_msg() const noexcept

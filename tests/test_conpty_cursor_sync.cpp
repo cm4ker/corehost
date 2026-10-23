@@ -1849,12 +1849,19 @@ bool test_vt_cpr_reply_not_f3()
 // 修复: process_input 的 Enter 处理设置 _enter_pending_newline 标志，
 //   api_write_console 输出文本前 consume_enter_newline() 检测标志 →
 //   先发 CUP 到 _term_cursor（下一行行首）再写文本。
+//
+// Enter typed as \r is echoed, and the flag set, only while a line read
+// (ReadConsole or ReadFile) with ENABLE_ECHO_INPUT is pending, as in
+// conhost. Apps that read key events (PSReadLine, ssh.exe, TUIs) echo it
+// themselves: a local CRLF scrolled the terminal under a prompt on the
+// bottom row, and their redraw then landed a row off. The tests below press
+// Enter during such a read.
 // ══════════════════════════════════════════════════════════════════
 
-// ── 1. \r 在非 ConsoleRead 模式下设置换行标志 ──
-// 模拟终端发送纯文本 "echo hello\r"（PSReadLine 渲染 + Enter 键）。
-// 注意: process_input 中 \r 的 keydown 被 input_enter() 送入 input_buffer，
-//   但 process_input 仍然检测到 b=='\r' 并处理光标。此处仅测试标志。
+// ── 1. \r ending a ReadFile line read sets the flag ──
+// The terminal sends "echo hello", then Enter (\r), while a ReadFile line
+// read with echo is pending: CRLF goes to the terminal, its cursor moves to
+// the next row's start and the flag is set.
 bool test_enter_newline_flag_set_on_cr()
 {
     pipe_bridge_test_context ctx;
@@ -1872,6 +1879,7 @@ bool test_enter_newline_flag_set_on_cr()
     ASSERT(bridge.test_get_enter_newline_flag() == false);
 
     // process_input 接收 \r（Enter 键 raw byte），检测后应设置标志
+    bridge.test_enter_raw_read_mode();
     bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
 
     // ── 验证: _enter_pending_newline 被置位 ──
@@ -1883,6 +1891,29 @@ bool test_enter_newline_flag_set_on_cr()
     return true;
 }
 
+// ── 1b. \r to a key-event reader, or with echo off: nothing echoed ──
+// Without a pending line read (PSReadLine and the like read key events) or
+// with ENABLE_ECHO_INPUT off, the terminal cursor stays where the app put it
+// and no flag is set.
+bool test_enter_no_echo_without_echoing_line_read()
+{
+    for (const bool read_without_echo : {false, true})
+    {
+        pipe_bridge_test_context ctx;
+        auto &bridge = ctx.bridge;
+        bridge.test_set_term_cursor_valid({17, 5});
+        bridge.sync_cursor_after_write({17, 5});
+        bridge.test_feed_echo_bytes((const BYTE *)"echo hello", 10);
+        if (read_without_echo)
+            bridge.test_enter_raw_read_mode(false);
+        bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
+        ASSERT(bridge.test_get_enter_newline_flag() == false);
+        ASSERT(bridge.test_get_term_cursor().X == 27);
+        ASSERT(bridge.test_get_term_cursor().Y == 5);
+    }
+    return true;
+}
+
 // ── 2. consume_enter_newline() 消耗标志并返回 true ──
 // api_write_console 在输出 "hello" 文本前调用此方法。
 bool test_enter_newline_consume_flag()
@@ -1891,6 +1922,7 @@ bool test_enter_newline_consume_flag()
     auto &bridge = ctx.bridge;
     bridge.test_set_term_cursor_valid({17, 5});
     bridge.test_feed_echo_bytes((const BYTE *)"echo hello", 10);
+    bridge.test_enter_raw_read_mode();
     bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
 
     ASSERT(bridge.test_get_enter_newline_flag() == true);
@@ -1969,6 +2001,7 @@ bool test_enter_newline_full_scenario()
     bridge.test_feed_echo_bytes((const BYTE *)"echo hello", 10);
 
     // ── 用户按 Enter → process_input 接收 \r → 设置标志 + term_cursor ──
+    bridge.test_enter_raw_read_mode();
     bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
     ASSERT(bridge.test_get_enter_newline_flag() == true);
 
@@ -2052,6 +2085,7 @@ bool test_clear_reset_newline_only_at_origin()
     ASSERT(bridge.test_get_term_cursor().X == 22);
 
     // Enter → flag 置位，_term_cursor = (0,6)
+    bridge.test_enter_raw_read_mode();
     bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
     ASSERT(bridge.test_get_enter_newline_flag() == true);
     ASSERT(bridge.test_get_term_cursor().X == 0);
@@ -2116,6 +2150,7 @@ bool test_clear_full_pipeline_prompt_on_row_0()
 
     // Step 2: type "clear" + Enter
     bridge.test_feed_echo_bytes((const BYTE *)"clear", 5);
+    bridge.test_enter_raw_read_mode();
     bridge.test_feed_raw_bytes((const BYTE *)"\r", 1);
     ASSERT(bridge.test_get_enter_newline_flag() == true);
 
@@ -2308,6 +2343,7 @@ int main()
 
     std::wcout << L"\nEnter Newline Flag Regression (echo hellohello) :\n";
     RUN_TEST(test_enter_newline_flag_set_on_cr, L"Flag set on CR");
+    RUN_TEST(test_enter_no_echo_without_echoing_line_read, L"No echo for key-event readers or with echo off");
     RUN_TEST(test_enter_newline_consume_flag, L"Consume clears flag");
     RUN_TEST(test_enter_newline_no_flag_when_no_cr, L"No flag without CR");
     RUN_TEST(test_enter_newline_flag_set_on_win32_enter, L"Flag set on Win32 Enter");
