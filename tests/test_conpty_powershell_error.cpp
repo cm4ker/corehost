@@ -517,7 +517,11 @@ int main()
 
     // 输入 hello + Enter
     write_all(session.input_write.get(), "hello\r");
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    // Wait for the error rather than a fixed time: on a slow runner (MSVC
+    // Debug) 3 s were not enough for the shell to print anything. Then give
+    // the rest of the error and its colors a moment.
+    session.reader->wait_for("The term", std::chrono::seconds(30));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     const auto output = session.reader->snapshot();
     std::printf("=== captured %zu bytes ===\n", output.size());
